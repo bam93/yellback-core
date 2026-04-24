@@ -10,14 +10,16 @@ import AVFoundation
 ///   - dbfs_threshold = -20 dBFS → RMS threshold of 0.1 → sine of amplitude
 ///     0.1·√2 ≈ 0.1414 sits exactly on the boundary.
 ///   - sustain_seconds = 0.3 → 13.2 buffers at 23ms/buffer.
-///   - cooldown_seconds = 1.0 → 43+ buffers at 23ms/buffer.
+///   - cooldown_seconds is in `ScreamConfig` for engine-level use; **the
+///     detector itself does NOT enforce it.** Continuous loud audio fires
+///     events at sustain cadence (~3.3 Hz for the default 0.3s sustain).
 final class MicDetectorTests: XCTestCase {
 
     // MARK: - Harness
 
     private final class Collector {
         var triggers: [TriggerEvent] = []
-        var intensities: [(Trigger, IntensitySignal)] = []
+        var intensities: [IntensitySignal] = []
     }
 
     private func makeDetector(
@@ -25,12 +27,9 @@ final class MicDetectorTests: XCTestCase {
         sampleRate: Double = 44_100
     ) -> (MicDetector, Collector) {
         let c = Collector()
-        let d = MicDetector(
-            config: config,
-            sampleRate: sampleRate,
-            onTrigger: { c.triggers.append($0) },
-            onIntensity: { c.intensities.append(($0, $1)) }
-        )
+        let d = MicDetector(config: config, sampleRate: sampleRate)
+        d.onTriggerEvent = { c.triggers.append($0) }
+        d.onIntensitySignal = { c.intensities.append($0) }
         return (d, c)
     }
 
@@ -47,8 +46,7 @@ final class MicDetectorTests: XCTestCase {
         let (d, c) = makeDetector()
         feed(d, AudioFixtures.silence(durationMs: 5_000))
         XCTAssertEqual(c.triggers.count, 0)
-        // Every intensity signal from pure silence should be effectively zero.
-        for (_, sig) in c.intensities {
+        for sig in c.intensities {
             XCTAssertLessThan(sig.value, 0.01, "silence should produce near-zero intensity")
         }
     }
@@ -62,17 +60,33 @@ final class MicDetectorTests: XCTestCase {
 
     // MARK: - Happy path
 
-    func testSustainedLoudSineFiresSingleTrigger() throws {
-        // Amplitude 0.5 → RMS ≈ 0.354 → dBFS ≈ -9 (well above -20). 1s is
-        // above both 300ms sustain and 1s cooldown, but the trigger fires at
-        // 300ms and the cooldown starts there — so only ONE trigger.
+    func testShortLoudClipFiresSingleTriggerWithExpectedPayload() throws {
+        // Amplitude 0.5 → RMS ≈ 0.354 → dBFS ≈ -9 (well above -20).
+        // 400ms is long enough for sustain (300ms) to fire exactly once
+        // (the post-emission sustain reset doesn't reach 300ms again
+        // before the clip ends).
         let (d, c) = makeDetector()
-        feed(d, AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 1_000))
+        feed(d, AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 400))
         XCTAssertEqual(c.triggers.count, 1)
         let event = try XCTUnwrap(c.triggers.first)
         XCTAssertEqual(event.trigger, .scream)
         XCTAssertGreaterThan(event.intensity, 0.5, "loud sine should have high intensity")
-        XCTAssertFalse(event.wasPrimed, "detector never sees priming state directly")
+        XCTAssertFalse(event.wasPrimed, "default primingMultiplier=1.0 → wasPrimed=false")
+    }
+
+    func testContinuousLoudAudioFiresAtSustainCadence() throws {
+        // 1000ms of continuous loud sine. With sustain=0.3s and no
+        // detector-level cooldown, sustain resets after each emission so
+        // emissions occur every ~300ms. 1s should produce ~3 triggers
+        // (at t≈0.3s, 0.6s, 0.9s). The engine's cooldown filter
+        // (Session 5) is what reduces this to a single playback per
+        // cooldown window.
+        let (d, c) = makeDetector()
+        feed(d, AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 1_000))
+        XCTAssertEqual(
+            c.triggers.count, 3,
+            "continuous loud at sustain=0.3s should fire ~3 times in 1s — engine handles rate limiting"
+        )
     }
 
     func testBriefLoudSpikeDoesNotTrigger() throws {
@@ -135,31 +149,24 @@ final class MicDetectorTests: XCTestCase {
         XCTAssertEqual(c.triggers.count, 0, "sustain must be continuous; intermittent loud must not accumulate")
     }
 
-    // MARK: - Cooldown
+    // MARK: - No detector-level cooldown (engine owns cooldown)
 
-    func testCooldownBlocksImmediateRetrigger() throws {
-        // scream 500ms → trigger. Gap 200ms (< 1s cooldown). Scream 500ms again.
-        // Only the first should fire; the second falls inside cooldown.
+    func testTwoCloseScreamsBothFireRegardlessOfShortGap() throws {
+        // Two 400ms screams separated by 100ms silence. The engine would
+        // (Session 5) suppress the second under default 1s cooldown; the
+        // detector itself does not. Asserts the contract: detector emits
+        // raw events, doesn't filter.
         let (d, c) = makeDetector()
         let seq = AudioFixtures.concat([
-            AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 500),
-            AudioFixtures.silence(durationMs: 200),
-            AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 500)
+            AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 400),
+            AudioFixtures.silence(durationMs: 100),
+            AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 400)
         ])
         feed(d, seq)
-        XCTAssertEqual(c.triggers.count, 1)
-    }
-
-    func testCooldownExpiryAllowsRetrigger() throws {
-        // scream → trigger. Gap 1200ms (> 1s cooldown). Scream again → trigger.
-        let (d, c) = makeDetector()
-        let seq = AudioFixtures.concat([
-            AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 500),
-            AudioFixtures.silence(durationMs: 1_200),
-            AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 500)
-        ])
-        feed(d, seq)
-        XCTAssertEqual(c.triggers.count, 2)
+        XCTAssertEqual(
+            c.triggers.count, 2,
+            "no detector-level cooldown: both screams fire (engine handles rate limiting)"
+        )
     }
 
     // MARK: - Voice band filter
@@ -184,11 +191,16 @@ final class MicDetectorTests: XCTestCase {
     func testVoiceBandFilterDisabledAcceptsOutOfBandEnergy() throws {
         // Same 50Hz tone, but with the voice-band filter explicitly disabled
         // via config. RMS measurement sees the full unfiltered signal and
-        // should trigger.
+        // should trigger. (Without the filter, 1s of continuous loud 50Hz
+        // fires at sustain cadence — the number matches continuous-loud
+        // behavior, i.e. >= 1 trigger is the relevant assertion.)
         let config = try ScreamConfig(voiceBandFilter: false)
         let (d, c) = makeDetector(config)
         feed(d, AudioFixtures.sine(frequency: 50, amplitude: 0.5, durationMs: 1_000))
-        XCTAssertEqual(c.triggers.count, 1, "with voiceBandFilter=false, 50Hz should reach RMS unfiltered and trigger")
+        XCTAssertGreaterThanOrEqual(
+            c.triggers.count, 1,
+            "with voiceBandFilter=false, 50Hz should reach RMS unfiltered and trigger at least once"
+        )
     }
 
     // MARK: - Priming hook (engine-settable threshold multiplier)
@@ -233,7 +245,23 @@ final class MicDetectorTests: XCTestCase {
             d.process(buffer: chunk)
         }
         XCTAssertEqual(c.intensities.count, chunks.count, "one intensity signal per process() call")
-        XCTAssertTrue(c.intensities.allSatisfy { $0.0 == .scream }, "MicDetector only emits .scream intensities")
+    }
+
+    // MARK: - isEnabled gate (Detector protocol)
+
+    func testIsEnabledFalseSuppressesAllCallbacks() throws {
+        let (d, c) = makeDetector()
+        d.isEnabled = false
+        feed(d, AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 1_000))
+        XCTAssertEqual(c.triggers.count, 0, "isEnabled=false: no trigger events")
+        XCTAssertEqual(c.intensities.count, 0, "isEnabled=false: no intensity signals either")
+    }
+
+    func testIsEnabledDefaultsToConfigEnabledFlag() throws {
+        let enabledConfig = try ScreamConfig(enabled: true)
+        let disabledConfig = try ScreamConfig(enabled: false)
+        XCTAssertTrue(MicDetector(config: enabledConfig).isEnabled)
+        XCTAssertFalse(MicDetector(config: disabledConfig).isEnabled)
     }
 
     // MARK: - Privacy invariant

@@ -1,61 +1,61 @@
 import Foundation
 import AVFoundation
 
-/// Microphone-based scream detector.
+/// Microphone-based scream detector. Conforms to `Detector` (see
+/// `Detector.swift` for the full contract).
 ///
 /// Consumes `AVAudioPCMBuffer`s of mono Float32 samples, optionally applies a
 /// 200Hz-3kHz Butterworth band-pass (cascade of two 2nd-order biquads), and
 /// computes RMS-based dBFS per buffer. Emits:
 ///
 ///   - A continuous `IntensitySignal` every `process(buffer:)` call, regardless
-///     of threshold — consumed by v2 fusion; v1 consumers may ignore.
-///   - A discrete `TriggerEvent` when dBFS has stayed at or above
-///     `ScreamConfig.dbfsThreshold` for at least `sustainSeconds` and the
-///     `cooldownSeconds` since the last firing has elapsed.
+///     of threshold (consumed by v2 fusion; v1 consumers may ignore).
+///   - A discrete `TriggerEvent` when dBFS has stayed at or above the
+///     effective threshold for at least `sustainSeconds`. Sustain resets
+///     after each emission, so continuous loud audio fires at sustain
+///     cadence (~1/sustainSeconds Hz).
+///
+/// **Cooldown is engine-level**, not detector-level. Per the project's
+/// architectural decision, detectors emit at their natural cadence; the
+/// engine filters rapid-fire events before they reach audio playback. This
+/// lets the engine see every event for stats and priming-state purposes.
 ///
 /// ## Privacy invariant
 ///
-/// `MicDetector` retains no audio samples between `process(buffer:)` calls
-/// beyond the **8 samples** of biquad filter history (two 2nd-order sections
-/// × four samples of state each). A debug-build `precondition` fires if any
-/// change causes `retainedAudioSampleCount` to exceed 8. This is the mechanism
-/// that enforces the architectural promise that this detector reads level
-/// only — never buffers, records, or transmits audio.
+/// Retains no audio samples between `process(buffer:)` calls beyond the
+/// **8 samples** of biquad filter history (two 2nd-order sections × four
+/// samples of state each). A debug-build `precondition` fires if any change
+/// causes `retainedAudioSampleCount` to exceed 8.
 ///
 /// ## Timekeeping
 ///
-/// Sustain and cooldown logic use a sample-accurate monotonic clock computed
-/// as `processedSamples / sampleRate`. This gives deterministic, identical
-/// behavior whether buffers arrive from a live audio tap or from synthetic
-/// test fixtures. `TriggerEvent.timestamp` uses wall-clock `Date()` so
-/// consumers can render human-readable timestamps.
+/// Sustain logic uses a sample-accurate monotonic clock computed as
+/// `processedSamples / sampleRate`. Deterministic across live audio and
+/// synthetic test buffers. `TriggerEvent.timestamp` uses wall-clock `Date()`
+/// for human-readable reporting.
 ///
 /// ## Threading
 ///
-/// `process(buffer:)` is expected to be called from a single thread —
-/// typically the audio-tap callback thread. `start(on:)` / `stop()` are
-/// expected to be called from one other thread (the engine's lifecycle
-/// thread). The detector does no internal locking; callers are responsible
-/// for serialising access if they do something unusual.
-///
-/// ## Sample rate
-///
-/// Biquad coefficients are computed once at init for the configured
-/// `sampleRate`. Buffers fed to `process(buffer:)` must share that rate.
-/// Mismatched rates will not crash but will produce subtly incorrect
-/// filtering and timing. When using `start(on:)`, initialise the detector
-/// with the input node's native rate.
-final class MicDetector {
+/// `process(buffer:)` runs on the audio-tap callback thread. `start()` and
+/// `stop()` are expected to be called from one other thread (e.g. the engine
+/// lifecycle thread or the CLI's main thread). Callback properties
+/// (`onTriggerEvent`, `onIntensitySignal`) are read from the audio thread —
+/// set them before `start()`.
+public final class MicDetector: Detector {
+
+    // MARK: - Detector conformance
+
+    public let trigger: Trigger = .scream
+
+    public var isEnabled: Bool
+
+    public var onTriggerEvent: ((TriggerEvent) -> Void)?
+    public var onIntensitySignal: ((IntensitySignal) -> Void)?
 
     // MARK: - Captured config
 
     private let config: ScreamConfig
     private let sampleRate: Double
-
-    // MARK: - Callbacks
-
-    private let onTrigger: (TriggerEvent) -> Void
-    private let onIntensity: (Trigger, IntensitySignal) -> Void
 
     // MARK: - State
 
@@ -63,12 +63,9 @@ final class MicDetector {
     private var processedSamples: Int = 0
 
     /// Sample index at which we most recently observed the level rising above
-    /// threshold. `nil` means "currently below threshold" (or just reset).
+    /// threshold. `nil` means "currently below threshold" (or just reset
+    /// after an emission).
     private var sustainStartSample: Int? = nil
-
-    /// Sample index of the most recent trigger firing. `nil` means "never
-    /// fired this session."
-    private var lastTriggerSample: Int? = nil
 
     /// Engine-settable multiplier applied to this detector's effective
     /// threshold to implement the cross-trigger priming behaviour from
@@ -79,39 +76,87 @@ final class MicDetector {
     ///
     /// Default is `1.0` (no priming — effective threshold equals base).
     /// Values in `[0.1, 1.0]` match the config schema's validation bounds.
-    /// Session 3 ships this hook; Session 5 wires `YellBackEngine` to set it
-    /// when its owned `PrimingState` transitions.
-    ///
-    /// Concurrency: the engine is expected to write this between audio-tap
-    /// callbacks; `process(buffer:)` reads it. The race is benign (at worst
-    /// one buffer uses a stale multiplier) so no lock is taken.
-    var primingMultiplier: Double = 1.0
+    public var primingMultiplier: Double = 1.0
 
-    // MARK: - Tap state (live-audio convenience)
+    // MARK: - AVAudioEngine ownership
 
-    private weak var attachedNode: AVAudioInputNode?
+    /// MicDetector owns its own `AVAudioEngine` instance. SoundEngine
+    /// (Session 4) will own a separate engine for output. Apple's docs are
+    /// fine with two engines per process; this matches the per-detector
+    /// independence in ARCHITECTURE.md.
+    private var audioEngine: AVAudioEngine?
 
     // MARK: - Init
 
-    init(
-        config: ScreamConfig,
-        sampleRate: Double = 44_100,
-        onTrigger: @escaping (TriggerEvent) -> Void,
-        onIntensity: @escaping (Trigger, IntensitySignal) -> Void
-    ) {
+    public init(config: ScreamConfig, sampleRate: Double = 44_100) {
         self.config = config
         self.sampleRate = sampleRate
-        self.onTrigger = onTrigger
-        self.onIntensity = onIntensity
+        self.isEnabled = config.enabled
         self.voiceBandFilter = VoiceBandFilter(sampleRate: sampleRate)
     }
 
-    // MARK: - Process
+    // MARK: - Detector lifecycle
 
-    /// Primary entry point. Feed this a mono Float32 PCM buffer. Always emits
-    /// one `IntensitySignal`; additionally emits one `TriggerEvent` iff the
-    /// sustain and cooldown conditions are both met for this buffer.
+    /// Spin up an `AVAudioEngine`, hook the input node, install a tap that
+    /// forwards buffers to `process(buffer:)`, and start the engine.
+    /// Idempotent — calling twice replaces the previous setup.
+    ///
+    /// Doesn't request microphone permission. If the user has denied access,
+    /// `engine.start()` succeeds but the tap delivers silence. Consumers
+    /// should request mic permission before calling `start()`.
+    public func start() throws {
+        stop()
+
+        // Fail fast on explicit TCC denial so the CLI reports a clear error
+        // instead of hanging on `engine.start()` or silently delivering a
+        // silent tap. `.notDetermined` (first run) is allowed through —
+        // AVAudioEngine will either trigger a TCC prompt or return silently
+        // failed buffers depending on the host environment's signing /
+        // Info.plist state; the consumer sees empty intensity signals in
+        // the latter case and should surface that separately.
+        let authStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        switch authStatus {
+        case .denied, .restricted:
+            throw DetectorError.needsPrivilegedAccess(
+                trigger: .scream,
+                reason: "microphone access denied (System Settings → Privacy & Security → Microphone)"
+            )
+        case .notDetermined, .authorized:
+            break
+        @unknown default:
+            break
+        }
+
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.inputFormat(forBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.process(buffer: buffer)
+        }
+        do {
+            try engine.start()
+        } catch {
+            throw DetectorError.inputSetupFailed(trigger: .scream, underlying: error.localizedDescription)
+        }
+        self.audioEngine = engine
+    }
+
+    public func stop() {
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        audioEngine?.stop()
+        audioEngine = nil
+    }
+
+    // MARK: - Process (testable core)
+
+    /// Primary detection entry point. Feed a mono Float32 PCM buffer; emits
+    /// one `IntensitySignal` and possibly one `TriggerEvent`. Called from the
+    /// audio-tap callback at runtime, or directly from tests with synthesised
+    /// buffers.
+    ///
+    /// Skips processing entirely if `isEnabled == false`.
     func process(buffer: AVAudioPCMBuffer) {
+        guard isEnabled else { return }
         guard let channelData = buffer.floatChannelData?[0] else { return }
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0 else { return }
@@ -131,12 +176,10 @@ final class MicDetector {
         let now = Date()
 
         let intensity = normalizedIntensity(fromDBFS: dbfs)
-        onIntensity(.scream, IntensitySignal(value: intensity, timestamp: now))
+        onIntensitySignal?(IntensitySignal(value: intensity, timestamp: now))
 
         evaluateTrigger(dbfs: dbfs, intensity: intensity, bufferStartSample: bufferStartSample, now: now)
 
-        // Privacy invariant: 8 = biquad state (4 samples × 2 sections). Any growth
-        // here means someone added audio-buffering state — violate the promise.
         precondition(
             retainedAudioSampleCount <= 8,
             "MicDetector retains \(retainedAudioSampleCount) samples, exceeding the 8-sample privacy invariant"
@@ -145,32 +188,10 @@ final class MicDetector {
 
     // MARK: - Diagnostics (internal, for tests)
 
-    /// Number of audio samples this detector currently holds between process
-    /// calls. Must remain <= 8 (biquad history) at all times.
+    /// Number of audio samples this detector currently holds between
+    /// `process(buffer:)` calls. Must remain `<= 8` (biquad history) at all times.
     var retainedAudioSampleCount: Int {
         voiceBandFilter.retainedSampleCount
-    }
-
-    // MARK: - Live-audio convenience
-
-    /// Install an audio tap on `inputNode` that feeds `process(buffer:)`.
-    /// Idempotent — calling twice replaces the tap.
-    ///
-    /// Not exercised by unit tests (would require mic permission and a
-    /// running AVAudioEngine). Session 5 wires this through YellBackEngine;
-    /// until then, consumers feed `process(buffer:)` directly.
-    func start(on inputNode: AVAudioInputNode) {
-        stop()
-        let format = inputNode.inputFormat(forBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.process(buffer: buffer)
-        }
-        attachedNode = inputNode
-    }
-
-    func stop() {
-        attachedNode?.removeTap(onBus: 0)
-        attachedNode = nil
     }
 
     // MARK: - Detection helpers
@@ -184,23 +205,20 @@ final class MicDetector {
     }
 
     private func dbfsFromRMS(_ rms: Float) -> Double {
-        // Guard against log10(0). Anything below ~1e-10 is effectively silence.
         guard rms > 1e-10 else { return -200.0 }
         return 20.0 * log10(Double(rms))
     }
 
-    /// Map dBFS to a 0..1 intensity signal, linear in dB, clipped at -60 and 0.
     private func normalizedIntensity(fromDBFS dbfs: Double) -> Double {
         let clipped = max(-60.0, min(0.0, dbfs))
         return (clipped + 60.0) / 60.0
     }
 
     private func evaluateTrigger(dbfs: Double, intensity: Double, bufferStartSample: Int, now: Date) {
-        // Apply the priming-state multiplier to the base threshold. In RMS
-        // space the multiplier is literal (effective_rms = base_rms × mult);
-        // in dBFS space that becomes an additive offset of 20·log10(mult).
-        // Guard multiplier <= 0 even though schema bounds prevent it — log10
-        // of a non-positive is undefined.
+        // Apply the priming multiplier to the base threshold. Multiplier acts
+        // in RMS space (effective_rms = base_rms × mult); in dBFS that's an
+        // additive offset of 20·log10(mult). Guard mult ≤ 0 even though
+        // schema bounds prevent it.
         let effectiveThreshold: Double
         if primingMultiplier > 0 {
             effectiveThreshold = config.dbfsThreshold + 20.0 * log10(primingMultiplier)
@@ -213,9 +231,6 @@ final class MicDetector {
             return
         }
 
-        // This buffer's level is above the (possibly primed) threshold. If we
-        // were below-threshold before, mark the start of this buffer as the
-        // beginning of sustain.
         if sustainStartSample == nil {
             sustainStartSample = bufferStartSample
         }
@@ -224,25 +239,20 @@ final class MicDetector {
         let sustainDuration = Double(sustainSamples) / sampleRate
         guard sustainDuration >= config.sustainSeconds else { return }
 
-        if let last = lastTriggerSample {
-            let elapsedSinceLast = Double(processedSamples - last) / sampleRate
-            guard elapsedSinceLast >= config.cooldownSeconds else { return }
-        }
-
-        lastTriggerSample = processedSamples
-        // Reset sustain so the next trigger requires another full sustain
-        // window to accumulate from scratch (see ARCHITECTURE.md's priming
-        // rationale — continuous loud audio fires once per cooldown period,
-        // not once per sustain period).
+        // Sustain is met. Reset for the next emission window — without this,
+        // every subsequent buffer above threshold would fire a redundant
+        // event at audio-tap rate (~43 Hz). Resetting gives a natural
+        // emission cadence of `sustainSeconds` during continuous loud audio.
+        // The engine is responsible for cooldown-based filtering on top of
+        // this.
         sustainStartSample = nil
 
-        // `wasPrimed` is true iff the firing only happened because priming
-        // lowered the threshold — i.e. dbfs was below base but above the
-        // primed effective threshold. If the signal was loud enough to
-        // trigger without priming, report `false`.
+        // wasPrimed is true iff the firing only happened because priming
+        // lowered the threshold (dbfs below base, above primed). If the
+        // signal was loud enough to trigger without priming, report false.
         let wasPrimed = dbfs < config.dbfsThreshold && dbfs >= effectiveThreshold
 
-        onTrigger(TriggerEvent(
+        onTriggerEvent?(TriggerEvent(
             trigger: .scream,
             timestamp: now,
             intensity: intensity,
