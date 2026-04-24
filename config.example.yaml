@@ -1,0 +1,35 @@
+# YellBack config — copy to ~/.config/yellback/config.yaml and edit.
+# Schema reference: CONFIG_SCHEMA.md
+
+triggers:
+  scream:
+    enabled: true
+    dbfs_threshold: -20            # float, -60..0. -20 = firm shout; -30 = normal talking; -10 = full scream
+    sustain_seconds: 0.3           # minimum duration above threshold
+    voice_band_filter: true        # apply 200Hz-3kHz band-pass
+    cooldown_seconds: 1.0
+
+  rage_type:
+    enabled: true
+    keystrokes_per_second_threshold: 8    # int, >=1. Rage typing: 8+
+    rolling_window_seconds: 2.0
+    cooldown_seconds: 1.5
+
+  desk_bang:
+    enabled: true
+    g_force_threshold: 1.5         # delta from 1g baseline; >0
+    cooldown_seconds: 0.8
+
+priming:
+  enabled: true
+  window_seconds: 5.0              # duration of primed state after any trigger
+  threshold_multiplier: 0.75       # 0.1..1.0; applied to *other* triggers while primed
+
+audio:
+  master_volume: 0.8               # 0.0..1.0, or null to follow system volume
+  pack: crowd                      # must match a pack id in packs_directory or the bundled default
+
+packs_directory: ~/.config/yellback/packs/
+
+logging:
+  level: info                      # debug | info | warn | error
