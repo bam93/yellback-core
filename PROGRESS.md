@@ -4,14 +4,16 @@ This file is the primary handoff artifact between Claude Code sessions. Every se
 
 ## Current State
 
-**Session count:** 2.5
+**Session count:** 3
 **Build status:** `swift build` green (Yams 5.4.0 resolved)
-**Test status:** `swift test` green — 57 tests passing (1 scaffold + 24 ConfigLoader YAML-path + 15 ConfigValidation programmatic-path + 9 ConfigBoundary + 8 ConfigDiagnostics)
+**Test status:** `swift test` green — 73 tests passing (1 scaffold + 24 ConfigLoader YAML-path + 15 ConfigValidation programmatic-path + 9 ConfigBoundary + 8 ConfigDiagnostics + 16 MicDetector)
 **Last updated:** 2026-04-24
 
 ## Summary
 
-Session 2 implemented the config layer. `EngineConfig` is now a tree of typed, Equatable structs (`TriggersConfig`/`ScreamConfig`/`RageTypeConfig`/`DeskBangConfig`/`PrimingConfig`/`AudioConfig`/`LoggingConfig` + `LogLevel`), each with defaults matching `config.example.yaml`. Validation lives on each leaf struct's throwing init (not in `ConfigLoader`), so programmatic construction by the paid Mac app goes through the same validation as YAML loading. `ConfigLoader` is a pure YAML→struct translator that catches `ConfigError.invalidValue` from struct inits and enriches the error with the full dotted field path and the Yams line number before re-throwing. `ConfigLoader.load(from:)` / `.loadFromString(_:)` return a `LoadResult(config, warnings: [ConfigWarning])`. Every validation rule from `CONFIG_SCHEMA.md` lines 137-147 is enforced; malformed YAML carries line numbers where Yams provides them. The CLI now accepts `--config <path>` and prints the parsed config. Session 1 still stands: public API surface unchanged except for `EngineConfig` growing from an empty struct to the nested tree.
+Session 3 implemented the first real detector: `MicDetector`. A buffer-in API (`process(buffer:)`) takes mono Float32 PCM, runs an optional 200Hz–3kHz Butterworth band-pass (hand-rolled as a cascade of two biquads), computes RMS-based dBFS, emits a continuous `IntensitySignal` per buffer and a discrete `TriggerEvent` when dBFS crosses `dbfsThreshold` and stays there for `sustainSeconds`, respecting `cooldownSeconds`. Sample-accurate internal clock derived from `processedSamples / sampleRate` — identical behaviour for live audio and synthetic test buffers. Privacy invariant (retains no audio beyond the 8 samples of biquad filter history) is enforced via a `precondition` inside `process()` that's also asserted as a post-condition by tests. Live-audio convenience (`start(on:)` / `stop()`) is implemented but not yet wired into `YellBackEngine`.
+
+Session 2 implemented the config layer. `EngineConfig` is a tree of typed, Equatable structs (`TriggersConfig`/`ScreamConfig`/`RageTypeConfig`/`DeskBangConfig`/`PrimingConfig`/`AudioConfig`/`LoggingConfig` + `LogLevel`), each with defaults matching `config.example.yaml`. Validation lives on each leaf struct's throwing init (not in `ConfigLoader`), so programmatic construction by the paid Mac app goes through the same validation as YAML loading. `ConfigLoader` is a pure YAML→struct translator that catches `ConfigError.invalidValue` from struct inits and enriches the error with the full dotted field path and the Yams line number before re-throwing. `ConfigLoader.load(from:)` / `.loadFromString(_:)` return a `LoadResult(config, warnings: [ConfigWarning])`. Every validation rule from `CONFIG_SCHEMA.md` lines 137-147 is enforced; malformed YAML carries line numbers where Yams provides them. The CLI accepts `--config <path>` and prints the parsed config. Session 1 landed the Swift Package scaffold with public API stubs from ARCHITECTURE.md.
 
 ## What Has Been Completed
 
@@ -35,6 +37,24 @@ Session 2 implemented the config layer. `EngineConfig` is now a tree of typed, E
 - `Tests/YellBackCoreTests/ConfigValidationTests.swift` — 15 tests on the programmatic path: each leaf struct rejects at least one invalid value, errors carry snake_case field names and `line: nil`, and a round-trip test confirms the YAML path still enriches struct-init errors with full path + Yams line.
 - `EngineConfig` moved out of `YellBackEngine.swift` into `EngineConfig.swift`. `YellBackEngine.swift` shrinks to just the engine class + `PermissionState`/`PermissionStatus`.
 
+**From Session 3 (MicDetector):**
+
+- `Sources/YellBackCore/Detectors/MicDetector.swift` — rewritten from empty stub into a real detector. Exposes `process(buffer:)` as the primary entry point (used both by tests with synthesised buffers and by the live input-tap callback), plus `start(on: AVAudioInputNode)` / `stop()` convenience that installs and tears down a tap. Sustain and cooldown logic use a sample-accurate monotonic clock (`processedSamples / sampleRate`), giving deterministic, identical behaviour in tests and at runtime. `TriggerEvent.timestamp` uses wall-clock `Date()` for consumer-facing reporting.
+- **Nested types in the same file:**
+  - `Biquad` — single 2nd-order direct-form-I biquad with RBJ-cookbook Butterworth HPF and LPF factory methods.
+  - `VoiceBandFilter` — 200Hz HPF cascaded with 3kHz LPF, applied only when `ScreamConfig.voiceBandFilter == true`.
+- **Privacy invariant** (`MicDetector.retainedAudioSampleCount`): must remain `<= 8` — the 8 samples of biquad filter history (4 per section × 2 sections). Enforced at runtime by a `precondition` that fires inside every `process(buffer:)`, and asserted as a post-condition by `testRetainedAudioSampleCountNeverExceedsEight` after 10 seconds of synthesised audio.
+- `Tests/YellBackCoreTests/AudioFixtures.swift` — pure-Swift generators for mono Float32 PCM buffers: `silence(durationMs:)`, `sine(frequency:amplitude:durationMs:)`, `whiteNoise(amplitude:durationMs:seed:)`, plus `concat(_:)` for building sequences and `chunk(_:intoChunksOfMs:)` for slicing into realistic ~23ms live-tap-sized pieces. Includes a deterministic `SplitMix64` PRNG for reproducible noise. No committed audio files.
+- `Tests/YellBackCoreTests/MicDetectorTests.swift` — 16 tests covering the Session 2.5 thoroughness bar:
+  - **Silence & sub-threshold:** silence produces no triggers and ~0 intensity; sub-threshold sine doesn't trigger.
+  - **Happy path:** sustained loud sine fires exactly one trigger with `.scream` type and high intensity; brief loud spike doesn't (fails sustain).
+  - **dBFS threshold boundary:** amplitude 0.16 (≈ -19 dBFS) triggers; amplitude 0.12 (≈ -21 dBFS) doesn't.
+  - **Sustain boundary:** 280ms loud doesn't trigger; 330ms does; intermittent 150ms loud + 150ms silent patterns don't trigger (sustain must be continuous).
+  - **Cooldown:** 200ms gap between screams blocks the second; 1200ms gap allows it.
+  - **Voice-band filter:** 50Hz rumble rejected; 10kHz tone rejected; disabling the filter lets 50Hz rumble trigger.
+  - **Intensity signal:** exactly one signal per `process()` call, all tagged `.scream`.
+  - **Privacy invariant:** after 10s of audio, retained sample count is exactly 8.
+
 **From Session 2.5 (test-thoroughness pass):**
 
 - `Tests/YellBackCoreTests/ConfigBoundaryTests.swift` — 9 tests covering *every* closed-interval boundary: `dbfs_threshold` at `0` and `-60`, `_seconds` at `60`, `cooldown_seconds` at `0`, `threshold_multiplier` at `0.1` and `1.0`, `master_volume` at `0.0` and `1.0` and `nil`, `keystrokes_per_second_threshold` at `1`, `g_force_threshold` at `0.0001`. Plus "just-outside" tests at `±0.01` to catch `<` vs `<=` off-by-ones.
@@ -51,32 +71,32 @@ Nothing — session 2 is clean closed.
 - **`swift test` requires full Xcode, not just Command Line Tools.** On machines where `xcode-select -p` points at `/Library/Developer/CommandLineTools`, `XCTest` is not on the module search path and `swift test` fails. Workaround: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`, or run `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer` once. This is a standard macOS SwiftPM caveat — document it in README when we get to a release-prep session, not now.
 - The original `PROGRESS.md` next-session checklist listed "Create LICENSE" and "Create README.md", but both shipped with the harness commit. The checklist is now accurate (session 1 updated/kept them rather than creating).
 
-## Next Session (Session 3)
+## Next Session (Session 4)
 
-**Confirmed scope: `MicDetector` with synthetic-audio tests.** Reason: the microphone scream detector is the riskiest detector technically (real-time AVAudioEngine tap, RMS, band-pass, sustain logic) — derisking it early means Sessions 4-5 can focus on audio output and orchestration rather than re-litigating detection tuning. Also unblocks the end-to-end scream→sound flow, which is the most viscerally useful demo.
+**Recommended scope: `SoundEngine` + source the Crowd pack.** Reason: the audio-output path is the other "risky" half of the stack (AVAudioEngine lifecycle, device-change handling, node pool management, sub-100ms trigger-to-first-audio latency). Getting it solid in Session 4 means Session 5 can focus purely on wiring (detector → engine → audio-output) without also debugging audio playback.
 
 **Deliverables:**
-1. `MicDetector` class owning an `AVAudioEngine` input tap. Consumes `ScreamConfig` in its init.
-2. Compute RMS per buffer; apply 200Hz-3kHz band-pass when `voiceBandFilter == true`. Convert RMS to dBFS.
-3. Emit a continuous `IntensitySignal` at a sensible sample rate (proposal: ~20 Hz, one signal per ~50ms of audio) via a consumer-supplied callback.
-4. Emit a discrete `TriggerEvent` when dBFS has stayed above `dbfsThreshold` for at least `sustainSeconds`, respecting `cooldownSeconds`.
-5. Synthetic-audio test fixtures under `Tests/YellBackCoreTests/Fixtures/` — pre-recorded / generated `.wav` or raw-PCM samples for a "shout," a "quiet-room," and a "loud-but-short clap." Unit tests feed these into the detector and assert trigger timing + intensity ranges.
-6. Do NOT yet wire `MicDetector` into `YellBackEngine.start()` — that wiring is Session 5. Session 3 only needs the detector and its tests.
+1. `SoundEngine` that wraps `AVAudioEngine` + a pool of `AVAudioPlayerNode`s (proposal: 8 nodes). Exposes `play(clip: ClipHandle, volume: Float)` and a pack-switch entry point.
+2. `SoundPack` loading from a directory containing `pack.yaml` + `.caf` clips. Clips preloaded as `AVAudioPCMBuffer`s at pack-switch time, never at trigger time (AUDIO_NOTES.md latency guarantee).
+3. Master-volume behaviour: follow system when `masterVolume == nil`, override to the configured level otherwise. Respect mute.
+4. No-repeat tracking: remember recently-played clips per session, avoid repeats until the tier's clip pool is exhausted.
+5. Source the Crowd pack: a handful of CC0/CC-BY "audience cheer/boo" clips, committed under `Resources/Packs/crowd/` with per-clip attribution in `ATTRIBUTIONS.md`. Sources worth checking: freesound.org (filter CC0), archive.org's audience-reaction collections, BBC sound effects archive (category-dependent).
+6. Tests for `SoundEngine`: pack loads and preloads; unknown pack id fails; no-repeat tracking holds through a full cycle; play() queues without allocating. **Do not** unit-test actual audio output (requires a sound card).
+7. A `ClipPackLoaderTests`-style drift test: `pack.yaml` parses into the expected structure.
 
-**Design questions to resolve at the start of Session 3:**
-- Buffer size / sample rate for the input tap (affects latency vs CPU).
-- Band-pass implementation: `AVAudioUnitEQ`, a hand-rolled biquad, or vDSP? vDSP is probably the right call for <100ms latency.
-- Fixture generation: record once from a real mic, OR synthesize in Swift (sine wave + noise) and commit the generator script? Synthesising is more reproducible in CI and doesn't require hardware.
-- Privacy invariant: the RMS/band-pass pipeline must never buffer more than N ms of audio. Pick N, enforce via an assert in tests.
+**Design questions to resolve at start of Session 4:**
+- `pack.yaml` schema: how are clips grouped by intensity tier? Single-tier for v1 (just "scream responses") or already multi-tier (quiet/medium/loud)?
+- Clip duration / format constraints: all clips mono or stereo? Max duration? Sample rate normalised to 44.1kHz at pack-build time or at load time?
+- Node pool size: 8 is a starting number — rationale?
+- Where to source the Crowd pack audio — freesound.org, archive.org, BBC SFX? Each has different attribution requirements (see ATTRIBUTIONS.md "accepted licenses" section).
+- Handling of `device change` events during playback: drain queue and restart engine? Continue on new device?
 
-**Do not attempt in Session 3:**
-- KeyboardDetector or AccelerometerDetector (Sessions 4+ after audio is grounded)
-- SoundEngine or audio playback (Session 4)
-- Wiring anything into YellBackEngine (Session 5)
-- Sourcing Crowd pack audio (Session 4)
-- Priming state (Session 5 at earliest)
+**Do not attempt in Session 4:**
+- Wire detectors to the audio engine (Session 5)
+- KeyboardDetector or AccelerometerDetector (Session 6+)
+- Priming state (Session 5)
 
-**Tentative order for later sessions:** Session 4 = `SoundEngine` + source the Crowd pack; Session 5 = wire scream→sound through `YellBackEngine` + introduce `PrimingState`; Session 6 = `KeyboardDetector`; Session 7 = `AccelerometerDetector`.
+**Tentative order for later sessions:** Session 5 = wire scream→sound through `YellBackEngine` + introduce `PrimingState`; Session 6 = `KeyboardDetector`; Session 7 = `AccelerometerDetector`.
 
 ## Architecture Decisions Log
 
@@ -104,9 +124,15 @@ Nothing — session 2 is clean closed.
 - **[session 2 addendum / 2026-04-24]** `.default` accessors on throwing leaf structs use `try!` against the known-valid default values (e.g. `public static let default = try! ScreamConfig()`). Rationale: `try!` gives a loud, immediate crash at first module import if anyone accidentally changes a default value to something that violates a rule — a failure mode that's far preferable to silently shipping invalid defaults.
 - **[session 2.5 / 2026-04-24]** Yams `Mark.line` is 1-based, not 0-based. `ConfigError` and `ConfigWarning` store and render whatever Yams produces, with no offset applied. Session 2 had applied `+ 1` in `description` under the wrong assumption, rendering every user-facing line number one higher than the actual source line. Caught by a new line-accuracy test on first run, fixed by dropping the offset. `ConfigDiagnosticsTests.testInvalidValueDescriptionFormat` now locks the 1-based contract explicitly: a `line: 4` in the error renders as `"line 4"`, and an explicit `XCTAssertFalse(...contains("line 5"))` would fail loudly if anyone reintroduces an offset.
 - **[session 2.5 / 2026-04-24]** The testing bar for all subsequent sessions matches Session 2.5: boundary values for every closed-interval rule (accept at boundary, reject just outside), exact source-line accuracy for user-facing diagnostics, `contains()`-based description format tests, and one drift/sync test per config surface to catch docs-vs-code mismatch. Session 2's original landing skipped all four categories; Session 2.5 is the retroactive fix.
+- **[session 3 / 2026-04-25]** `MicDetector` is buffer-in (not tap-owning) as its primary interface. The scope originally said "MicDetector owns an AVAudioEngine input tap" — that was refined at session start to a split design: `process(buffer:)` is the testable core (called from either the tap or a synthetic test buffer), and `start(on: AVAudioInputNode)` is a thin convenience wrapper that installs a tap and forwards to `process()`. Rationale: tests never need an AVAudioEngine or mic permission; they feed synthetic buffers directly. Live code gets a one-line "start listening" API.
+- **[session 3 / 2026-04-25]** Sustain and cooldown logic use a sample-accurate monotonic clock derived from `processedSamples / sampleRate`, NOT wall-clock `Date()` and NOT `AVAudioTime`. Rationale: synthetic test buffers can advance "time" deterministically without real wall-clock passage, so a test feeding 350ms of sine samples genuinely exercises the 300ms sustain boundary. Wall clock in tests would either require real sleeps (slow, flaky) or a mocked clock (more surface area). `TriggerEvent.timestamp` still uses `Date()` so consumers get meaningful human-facing timestamps.
+- **[session 3 / 2026-04-25]** Privacy invariant for detectors is enforced by a debug-build `precondition` on an internal `retainedAudioSampleCount` property, checked at the end of every `process()` call. `MicDetector` currently retains 8 samples (two biquad sections × 4 samples of history each). Any future change that causes retention to grow fires the precondition immediately. Tests additionally assert the post-condition after 10 seconds of audio as loud documentation. Later detectors (KeyboardDetector, AccelerometerDetector) should follow the same pattern for their respective privacy contracts.
+- **[session 3 / 2026-04-25]** Band-pass filter is a hand-rolled cascade of two RBJ-cookbook Butterworth biquads (HPF @ 200Hz + LPF @ 3kHz), not `AVAudioUnitEQ` and not `vDSP_biquad`. Rationale: AVAudioUnitEQ would force `MicDetector` into an AVAudioEngine graph for filtering, which breaks the clean buffer-in API and makes tests need an engine. vDSP is a drop-in optimisation if profiling ever shows we need it (today 16 tests processing thousands of synthetic buffers complete in 0.7s — we don't). The hand-rolled biquad is ~40 lines, zero-dependency, and trivially testable.
+- **[session 3 / 2026-04-25]** `AudioFixtures` generates synthetic PCM buffers at test time rather than committing real recordings. Rationale: real recordings are (a) binary blobs in git, (b) only vaguely documented in terms of their acoustic properties, and (c) hard to regenerate if lost. Synthesised sine/silence/noise lets tests say "a 1kHz tone at amplitude 0.5 for 350ms" and assert the exact RMS (`0.5/√2 ≈ 0.354`) and dBFS (`≈ -9`) that will result. Later detector sessions can extend `AudioFixtures` for motion-sensor traces and keystroke streams using the same pattern.
 
 ## Session History
 
 - **Session 1 — 2026-04-24 — Scope: bootstrap the Swift Package scaffold.** Outcome: `swift build` and `swift test` both green. Public API stubs cover every type from ARCHITECTURE.md's public-API section. No detector/audio/config *logic* yet.
 - **Session 2 — 2026-04-24 — Scope: `ConfigLoader` + typed `EngineConfig`.** Outcome: 39 tests passing (1 scaffold + 23 ConfigLoader YAML-path + 15 ConfigValidation programmatic-path). `yellback --config config.example.yaml` prints a full parsed summary and exits 0. All validation rules from `CONFIG_SCHEMA.md` enforced except the deferred `packs_directory` disk check. Followed initial landing with an architectural refactor per user review: validation moved onto leaf struct inits so the Mac-app-constructed-directly path is validated, with `ConfigLoader` demoted to a pure YAML→struct translator that enriches struct-init errors with path+line. No detector work.
 - **Session 2.5 — 2026-04-24 — Scope: test-thoroughness pass per user review.** Outcome: 57 tests passing (+18 over Session 2). New files: `ConfigBoundaryTests.swift` covering every closed-interval boundary on both accept and just-outside-reject sides; `ConfigDiagnosticsTests.swift` locking exact source-line accuracy and `CustomStringConvertible` format. One test added to `ConfigLoaderTests` asserting `config.example.yaml` parses equal to `EngineConfig.default` (drift guard). Caught and fixed an off-by-one bug in `ConfigError`/`ConfigWarning` description rendering that had shipped in Session 2: Yams's `Mark.line` is natively 1-based, but the formatter was adding `+ 1`, so every user-facing line number was one higher than the actual source line.
+- **Session 3 — 2026-04-25 — Scope: `MicDetector` with synthetic-audio tests.** Outcome: 73 tests passing (+16 over Session 2.5), all green on first test-suite run. `MicDetector` exposes a testable `process(buffer:)` core plus a `start(on:)` live-tap convenience. Hand-rolled RBJ-cookbook Butterworth biquad band-pass filter (200Hz–3kHz) as a cascade of two 2nd-order sections. Privacy invariant enforced via `precondition` on internal `retainedAudioSampleCount`. `AudioFixtures` synthesises sine/silence/noise buffers deterministically — no committed audio binaries. No YellBackEngine wiring yet (deferred to Session 5 per plan).
