@@ -38,23 +38,22 @@ Nothing — session 1 is clean closed.
 
 ## Next Session (Session 2)
 
-**Recommended scope — pick ONE, not all:**
+**Confirmed scope: ConfigLoader + full config types.** Reason: every detector and the audio engine will need typed config in their initializers. Doing config first unblocks everything downstream.
 
-Option A — **ConfigLoader + full config types (recommended first).** Reason: every detector and the audio engine will need typed config in their initializers. Doing config first unblocks everything. Deliverables:
+**Deliverables:**
 1. Flesh out `EngineConfig` with nested structs (`TriggersConfig`, `ScreamConfig`, `RageTypeConfig`, `DeskBangConfig`, `PrimingConfig`, `AudioConfig`, `LoggingConfig`)
 2. Implement `ConfigLoader` using Yams — `static func load(from url: URL) throws -> EngineConfig`
-3. Enforce all validation rules from `CONFIG_SCHEMA.md` lines 136-148 with clear error messages
-4. Add tests: valid example loads, each validation rule fails as expected, malformed YAML fails cleanly
+3. Enforce all validation rules from `CONFIG_SCHEMA.md` lines 136-148 with clear, line-numbered (where possible) error messages
+4. Tests: valid `config.example.yaml` loads end-to-end; each validation rule fails as expected; malformed YAML fails cleanly with a helpful message
 5. Wire `yellback-cli/main.swift` to load `--config <path>` and print the parsed config — still no detectors
 
-Option B — **MicDetector with synthetic-audio tests.** The riskiest piece technically; doing it early de-risks the rest. Requires recording or synthesizing test `.caf` fixtures.
-
-Option C — **SoundEngine + clip playback with the Crowd pack sourced.** Needs CC0/CC-BY clips sourced first.
-
 **Do not attempt in session 2:**
-- More than one of the above
-- Wiring detectors to the audio engine (that's session 3+)
+- Any detector implementation (scream/rage-type/desk-bang)
+- Any audio-engine work
 - Priming state (engine-level, belongs after at least one detector exists)
+- Sourcing Crowd pack audio
+
+**Deferred to later sessions (tentative order):** session 3 = MicDetector + synthetic-audio test fixtures; session 4 = SoundEngine + sourcing the Crowd pack; session 5 = wire up the first end-to-end scream→sound flow and introduce PrimingState.
 
 ## Architecture Decisions Log
 

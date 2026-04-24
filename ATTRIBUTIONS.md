@@ -18,9 +18,5 @@ All other licenses (CC-BY-NC, proprietary, unclear provenance) are rejected.
 Bundled under `Resources/Packs/crowd/`. Single-tier "audience cheer / boo"
 clips used as the default when no user pack is configured.
 
-*No clips sourced yet — this section will be populated when the Crowd pack
-audio is added.*
-
-| Clip | Tier | Source | License | Attribution |
-|------|------|--------|---------|-------------|
-| _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+*No clips sourced yet — this section will grow a `| Clip | Tier | Source |
+License | Attribution |` table once the Crowd pack audio is added.*
