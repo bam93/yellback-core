@@ -41,14 +41,6 @@ public final class YellBackEngine {
     public var onPermissionStateChange: ((PermissionState) -> Void)?
 }
 
-/// Configuration consumed by `YellBackEngine` at init time.
-///
-/// Populated by `ConfigLoader` from YAML in v1. Keep this type small and
-/// value-typed — the engine owns a copy, not a reference.
-public struct EngineConfig {
-    public init() {}
-}
-
 /// Snapshot of required macOS permissions at a moment in time.
 public struct PermissionState {
     public let microphone: PermissionStatus
