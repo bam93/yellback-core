@@ -2,8 +2,9 @@ import Foundation
 
 /// Errors thrown by `ConfigLoader` when a config cannot be produced.
 ///
-/// Line numbers, when present, are 0-based internally and rendered as 1-based
-/// in `description` (matching what users see in their text editor).
+/// Line numbers, when present, are 1-based — matching what users see in their
+/// text editor and what Yams produces natively from `Mark.line`. No off-by-one
+/// conversion happens in `description`.
 public enum ConfigError: Error, Equatable {
     /// YAML is syntactically invalid.
     case malformedYAML(message: String, line: Int?)
@@ -23,13 +24,13 @@ extension ConfigError: CustomStringConvertible {
         switch self {
         case .malformedYAML(let message, let line):
             if let line = line {
-                return "malformed YAML (line \(line + 1)): \(message)"
+                return "malformed YAML (line \(line)): \(message)"
             }
             return "malformed YAML: \(message)"
 
         case .invalidValue(let field, let reason, let line):
             if let line = line {
-                return "invalid value at `\(field)` (line \(line + 1)): \(reason)"
+                return "invalid value at `\(field)` (line \(line)): \(reason)"
             }
             return "invalid value at `\(field)`: \(reason)"
 

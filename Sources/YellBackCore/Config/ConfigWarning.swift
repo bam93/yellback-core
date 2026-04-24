@@ -15,7 +15,7 @@ extension ConfigWarning: CustomStringConvertible {
         switch self {
         case .unknownKey(let path, let line):
             if let line = line {
-                return "unknown key `\(path)` (line \(line + 1)) — ignored"
+                return "unknown key `\(path)` (line \(line)) — ignored"
             }
             return "unknown key `\(path)` — ignored"
         }

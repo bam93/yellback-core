@@ -38,6 +38,19 @@ final class ConfigLoaderTests: XCTestCase {
         XCTAssertEqual(c.logging.level, .info)
     }
 
+    func testConfigExampleMatchesStructDefaults() throws {
+        // Locks the invariant that CONFIG_SCHEMA.md, config.example.yaml, and
+        // every struct's `public init(...)` default values stay in sync.
+        //
+        // If a contributor changes a default in Swift (e.g. `dbfsThreshold: -20`
+        // → `-25`) but forgets to update config.example.yaml, this test fails.
+        // Likewise in the other direction. Catches drift in either file before
+        // it reaches the user-facing copy in the docs.
+        let loaded = try ConfigLoader.load(from: Self.repoConfigExampleURL).config
+        XCTAssertEqual(loaded, EngineConfig.default,
+                       "config.example.yaml must parse equal to EngineConfig.default — one of the two is out of sync")
+    }
+
     // MARK: - Defaults / omissions
 
     func testOmittedScreamBlockDisablesScream() throws {
