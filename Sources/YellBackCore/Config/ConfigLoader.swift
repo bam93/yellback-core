@@ -4,13 +4,20 @@ import Yams
 /// Loads and validates the YAML config format documented in `CONFIG_SCHEMA.md`,
 /// producing an `EngineConfig` and a list of non-fatal `ConfigWarning`s.
 ///
-/// Validation failures throw `ConfigError`. Unknown keys never fail — they
-/// surface as warnings, keeping older binaries tolerant of newer configs.
+/// `ConfigLoader` is a pure YAML→struct translator. Per-field validation
+/// rules live on each leaf config struct's throwing init, so programmatic
+/// construction (e.g. the paid Mac app building an `EngineConfig` directly
+/// from its settings UI) is validated through the same code path.
+///
+/// Errors thrown from struct inits carry a local field name (e.g.
+/// `dbfs_threshold`) with `line: nil`. `ConfigLoader` catches these, prepends
+/// the full YAML path (`triggers.scream.dbfs_threshold`), looks up the line
+/// of the originating node in the Yams tree, and re-throws. Programmatic
+/// callers see the bare-name, line-less original.
 ///
 /// This type does no filesystem side-effects beyond reading the given file.
 /// In particular, it does NOT create or probe `packs_directory` — that check
-/// is deferred to `YellBackEngine.start()` so `ConfigLoader` is hermetic and
-/// tests can stay pure.
+/// is deferred to `YellBackEngine.start()`.
 public enum ConfigLoader {
     /// Result of a successful load.
     public struct LoadResult: Equatable {
@@ -40,8 +47,7 @@ public enum ConfigLoader {
         return try loadFromString(yaml)
     }
 
-    /// Load and validate a config from an in-memory YAML string. Used by tests
-    /// and by any consumer that already has YAML in a buffer.
+    /// Load and validate a config from an in-memory YAML string.
     public static func loadFromString(_ yaml: String) throws -> LoadResult {
         let rootNode: Node
         do {
@@ -105,12 +111,26 @@ public enum ConfigLoader {
         let allowed: Set<String> = ["scream", "rage_type", "desk_bang"]
         warnUnknownKeys(in: mapping, allowed: allowed, pathPrefix: "triggers.", warnings: &warnings)
 
-        let scream = try mapping["scream"].map { try parseScream($0, warnings: &warnings) }
-            ?? ScreamConfig(enabled: false)
-        let rageType = try mapping["rage_type"].map { try parseRageType($0, warnings: &warnings) }
-            ?? RageTypeConfig(enabled: false)
-        let deskBang = try mapping["desk_bang"].map { try parseDeskBang($0, warnings: &warnings) }
-            ?? DeskBangConfig(enabled: false)
+        let scream: ScreamConfig
+        if let s = mapping["scream"] {
+            scream = try parseScream(s, warnings: &warnings)
+        } else {
+            scream = try ScreamConfig(enabled: false)
+        }
+
+        let rageType: RageTypeConfig
+        if let r = mapping["rage_type"] {
+            rageType = try parseRageType(r, warnings: &warnings)
+        } else {
+            rageType = try RageTypeConfig(enabled: false)
+        }
+
+        let deskBang: DeskBangConfig
+        if let d = mapping["desk_bang"] {
+            deskBang = try parseDeskBang(d, warnings: &warnings)
+        } else {
+            deskBang = try DeskBangConfig(enabled: false)
+        }
 
         return TriggersConfig(scream: scream, rageType: rageType, deskBang: deskBang)
     }
@@ -124,20 +144,19 @@ public enum ConfigLoader {
 
         let enabled = try parseBool(mapping["enabled"], field: "triggers.scream.enabled", defaultValue: true)
         let dbfs = try parseDouble(mapping["dbfs_threshold"], field: "triggers.scream.dbfs_threshold", defaultValue: -20)
-        try checkDbfs(dbfs, field: "triggers.scream.dbfs_threshold", node: mapping["dbfs_threshold"])
         let sustain = try parseDouble(mapping["sustain_seconds"], field: "triggers.scream.sustain_seconds", defaultValue: 0.3)
-        try checkSecondsUpperBound(sustain, field: "triggers.scream.sustain_seconds", node: mapping["sustain_seconds"])
         let voiceBand = try parseBool(mapping["voice_band_filter"], field: "triggers.scream.voice_band_filter", defaultValue: true)
         let cooldown = try parseDouble(mapping["cooldown_seconds"], field: "triggers.scream.cooldown_seconds", defaultValue: 1.0)
-        try checkCooldown(cooldown, field: "triggers.scream.cooldown_seconds", node: mapping["cooldown_seconds"])
 
-        return ScreamConfig(
-            enabled: enabled,
-            dbfsThreshold: dbfs,
-            sustainSeconds: sustain,
-            voiceBandFilter: voiceBand,
-            cooldownSeconds: cooldown
-        )
+        return try withEnrichedValidation(path: "triggers.scream", in: mapping) {
+            try ScreamConfig(
+                enabled: enabled,
+                dbfsThreshold: dbfs,
+                sustainSeconds: sustain,
+                voiceBandFilter: voiceBand,
+                cooldownSeconds: cooldown
+            )
+        }
     }
 
     private static func parseRageType(_ node: Node, warnings: inout [ConfigWarning]) throws -> RageTypeConfig {
@@ -149,24 +168,17 @@ public enum ConfigLoader {
 
         let enabled = try parseBool(mapping["enabled"], field: "triggers.rage_type.enabled", defaultValue: true)
         let kps = try parseInt(mapping["keystrokes_per_second_threshold"], field: "triggers.rage_type.keystrokes_per_second_threshold", defaultValue: 8)
-        if kps < 1 {
-            throw ConfigError.invalidValue(
-                field: "triggers.rage_type.keystrokes_per_second_threshold",
-                reason: "must be >= 1 (got \(kps))",
-                line: mapping["keystrokes_per_second_threshold"]?.mark?.line
+        let window = try parseDouble(mapping["rolling_window_seconds"], field: "triggers.rage_type.rolling_window_seconds", defaultValue: 2.0)
+        let cooldown = try parseDouble(mapping["cooldown_seconds"], field: "triggers.rage_type.cooldown_seconds", defaultValue: 1.5)
+
+        return try withEnrichedValidation(path: "triggers.rage_type", in: mapping) {
+            try RageTypeConfig(
+                enabled: enabled,
+                keystrokesPerSecondThreshold: kps,
+                rollingWindowSeconds: window,
+                cooldownSeconds: cooldown
             )
         }
-        let window = try parseDouble(mapping["rolling_window_seconds"], field: "triggers.rage_type.rolling_window_seconds", defaultValue: 2.0)
-        try checkSecondsUpperBound(window, field: "triggers.rage_type.rolling_window_seconds", node: mapping["rolling_window_seconds"])
-        let cooldown = try parseDouble(mapping["cooldown_seconds"], field: "triggers.rage_type.cooldown_seconds", defaultValue: 1.5)
-        try checkCooldown(cooldown, field: "triggers.rage_type.cooldown_seconds", node: mapping["cooldown_seconds"])
-
-        return RageTypeConfig(
-            enabled: enabled,
-            keystrokesPerSecondThreshold: kps,
-            rollingWindowSeconds: window,
-            cooldownSeconds: cooldown
-        )
     }
 
     private static func parseDeskBang(_ node: Node, warnings: inout [ConfigWarning]) throws -> DeskBangConfig {
@@ -178,17 +190,11 @@ public enum ConfigLoader {
 
         let enabled = try parseBool(mapping["enabled"], field: "triggers.desk_bang.enabled", defaultValue: true)
         let g = try parseDouble(mapping["g_force_threshold"], field: "triggers.desk_bang.g_force_threshold", defaultValue: 1.5)
-        if g <= 0 {
-            throw ConfigError.invalidValue(
-                field: "triggers.desk_bang.g_force_threshold",
-                reason: "must be > 0 (got \(g))",
-                line: mapping["g_force_threshold"]?.mark?.line
-            )
-        }
         let cooldown = try parseDouble(mapping["cooldown_seconds"], field: "triggers.desk_bang.cooldown_seconds", defaultValue: 0.8)
-        try checkCooldown(cooldown, field: "triggers.desk_bang.cooldown_seconds", node: mapping["cooldown_seconds"])
 
-        return DeskBangConfig(enabled: enabled, gForceThreshold: g, cooldownSeconds: cooldown)
+        return try withEnrichedValidation(path: "triggers.desk_bang", in: mapping) {
+            try DeskBangConfig(enabled: enabled, gForceThreshold: g, cooldownSeconds: cooldown)
+        }
     }
 
     // MARK: - Priming
@@ -202,17 +208,11 @@ public enum ConfigLoader {
 
         let enabled = try parseBool(mapping["enabled"], field: "priming.enabled", defaultValue: true)
         let window = try parseDouble(mapping["window_seconds"], field: "priming.window_seconds", defaultValue: 5.0)
-        try checkSecondsUpperBound(window, field: "priming.window_seconds", node: mapping["window_seconds"])
         let multiplier = try parseDouble(mapping["threshold_multiplier"], field: "priming.threshold_multiplier", defaultValue: 0.75)
-        if multiplier < 0.1 || multiplier > 1.0 {
-            throw ConfigError.invalidValue(
-                field: "priming.threshold_multiplier",
-                reason: "must be in [0.1, 1.0] (got \(multiplier))",
-                line: mapping["threshold_multiplier"]?.mark?.line
-            )
-        }
 
-        return PrimingConfig(enabled: enabled, windowSeconds: window, thresholdMultiplier: multiplier)
+        return try withEnrichedValidation(path: "priming", in: mapping) {
+            try PrimingConfig(enabled: enabled, windowSeconds: window, thresholdMultiplier: multiplier)
+        }
     }
 
     // MARK: - Audio
@@ -229,16 +229,11 @@ public enum ConfigLoader {
             field: "audio.master_volume",
             defaultValue: 0.8
         )
-        if let v = masterVolume, v < 0.0 || v > 1.0 {
-            throw ConfigError.invalidValue(
-                field: "audio.master_volume",
-                reason: "must be in [0.0, 1.0] or null (got \(v))",
-                line: mapping["master_volume"]?.mark?.line
-            )
-        }
         let pack = try parseString(mapping["pack"], field: "audio.pack", defaultValue: "crowd")
 
-        return AudioConfig(masterVolume: masterVolume, pack: pack)
+        return try withEnrichedValidation(path: "audio", in: mapping) {
+            try AudioConfig(masterVolume: masterVolume, pack: pack)
+        }
     }
 
     // MARK: - Packs directory
@@ -276,39 +271,25 @@ public enum ConfigLoader {
         return LoggingConfig(level: level)
     }
 
-    // MARK: - Validation helpers
+    // MARK: - Struct-init error enrichment
 
-    private static func checkDbfs(_ value: Double, field: String, node: Node?) throws {
-        if value > 0 || value < -60 {
+    /// Runs a throwing struct init and, if it throws `.invalidValue` with a
+    /// local field name, re-throws with the full path and the line from the
+    /// originating YAML node.
+    private static func withEnrichedValidation<T>(
+        path: String,
+        in mapping: Node.Mapping,
+        _ construct: () throws -> T
+    ) throws -> T {
+        do {
+            return try construct()
+        } catch ConfigError.invalidValue(let field, let reason, _) {
             throw ConfigError.invalidValue(
-                field: field,
-                reason: "must be in [-60, 0] (got \(value))",
-                line: node?.mark?.line
+                field: "\(path).\(field)",
+                reason: reason,
+                line: mapping[field]?.mark?.line
             )
         }
-    }
-
-    /// Rule: any `_seconds` field > 60 is rejected as a likely user error.
-    private static func checkSecondsUpperBound(_ value: Double, field: String, node: Node?) throws {
-        if value > 60 {
-            throw ConfigError.invalidValue(
-                field: field,
-                reason: "must be <= 60 seconds (got \(value))",
-                line: node?.mark?.line
-            )
-        }
-    }
-
-    /// Rule: any `cooldown_seconds` < 0 is rejected, AND the general `_seconds > 60` rule.
-    private static func checkCooldown(_ value: Double, field: String, node: Node?) throws {
-        if value < 0 {
-            throw ConfigError.invalidValue(
-                field: field,
-                reason: "must be >= 0 (got \(value))",
-                line: node?.mark?.line
-            )
-        }
-        try checkSecondsUpperBound(value, field: field, node: node)
     }
 
     // MARK: - Scalar parsers
