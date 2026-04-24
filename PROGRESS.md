@@ -53,7 +53,7 @@ Nothing — session 2 is clean closed.
 
 ## Next Session (Session 3)
 
-**Recommended scope: `MicDetector` with synthetic-audio tests.** Reason: the microphone scream detector is the riskiest detector technically (real-time AVAudioEngine tap, RMS, band-pass, sustain logic) — derisking it early means Sessions 4-5 can focus on audio output and orchestration rather than re-litigating detection tuning. Also unblocks the end-to-end scream→sound flow, which is the most viscerally useful demo.
+**Confirmed scope: `MicDetector` with synthetic-audio tests.** Reason: the microphone scream detector is the riskiest detector technically (real-time AVAudioEngine tap, RMS, band-pass, sustain logic) — derisking it early means Sessions 4-5 can focus on audio output and orchestration rather than re-litigating detection tuning. Also unblocks the end-to-end scream→sound flow, which is the most viscerally useful demo.
 
 **Deliverables:**
 1. `MicDetector` class owning an `AVAudioEngine` input tap. Consumes `ScreamConfig` in its init.
