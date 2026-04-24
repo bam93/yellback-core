@@ -70,6 +70,23 @@ final class MicDetector {
     /// fired this session."
     private var lastTriggerSample: Int? = nil
 
+    /// Engine-settable multiplier applied to this detector's effective
+    /// threshold to implement the cross-trigger priming behaviour from
+    /// `ARCHITECTURE.md`. Per `CONFIG_SCHEMA.md` line 86, the multiplier acts
+    /// in RMS space — a value of `0.75` means "fire at 75% of the base RMS
+    /// threshold," which translates to a dBFS offset of `20·log10(0.75) ≈
+    /// -2.5 dB` on the detector's effective `dbfsThreshold`.
+    ///
+    /// Default is `1.0` (no priming — effective threshold equals base).
+    /// Values in `[0.1, 1.0]` match the config schema's validation bounds.
+    /// Session 3 ships this hook; Session 5 wires `YellBackEngine` to set it
+    /// when its owned `PrimingState` transitions.
+    ///
+    /// Concurrency: the engine is expected to write this between audio-tap
+    /// callbacks; `process(buffer:)` reads it. The race is benign (at worst
+    /// one buffer uses a stale multiplier) so no lock is taken.
+    var primingMultiplier: Double = 1.0
+
     // MARK: - Tap state (live-audio convenience)
 
     private weak var attachedNode: AVAudioInputNode?
@@ -179,13 +196,26 @@ final class MicDetector {
     }
 
     private func evaluateTrigger(dbfs: Double, intensity: Double, bufferStartSample: Int, now: Date) {
-        guard dbfs >= config.dbfsThreshold else {
+        // Apply the priming-state multiplier to the base threshold. In RMS
+        // space the multiplier is literal (effective_rms = base_rms × mult);
+        // in dBFS space that becomes an additive offset of 20·log10(mult).
+        // Guard multiplier <= 0 even though schema bounds prevent it — log10
+        // of a non-positive is undefined.
+        let effectiveThreshold: Double
+        if primingMultiplier > 0 {
+            effectiveThreshold = config.dbfsThreshold + 20.0 * log10(primingMultiplier)
+        } else {
+            effectiveThreshold = config.dbfsThreshold
+        }
+
+        guard dbfs >= effectiveThreshold else {
             sustainStartSample = nil
             return
         }
 
-        // This buffer's level is above threshold. If we were below-threshold
-        // before, mark the start of this buffer as the beginning of sustain.
+        // This buffer's level is above the (possibly primed) threshold. If we
+        // were below-threshold before, mark the start of this buffer as the
+        // beginning of sustain.
         if sustainStartSample == nil {
             sustainStartSample = bufferStartSample
         }
@@ -206,13 +236,17 @@ final class MicDetector {
         // not once per sustain period).
         sustainStartSample = nil
 
+        // `wasPrimed` is true iff the firing only happened because priming
+        // lowered the threshold — i.e. dbfs was below base but above the
+        // primed effective threshold. If the signal was loud enough to
+        // trigger without priming, report `false`.
+        let wasPrimed = dbfs < config.dbfsThreshold && dbfs >= effectiveThreshold
+
         onTrigger(TriggerEvent(
             trigger: .scream,
             timestamp: now,
             intensity: intensity,
-            // Priming is engine-level state; the detector itself doesn't know.
-            // Always false for detectors invoked without engine coordination.
-            wasPrimed: false
+            wasPrimed: wasPrimed
         ))
     }
 }

@@ -191,6 +191,38 @@ final class MicDetectorTests: XCTestCase {
         XCTAssertEqual(c.triggers.count, 1, "with voiceBandFilter=false, 50Hz should reach RMS unfiltered and trigger")
     }
 
+    // MARK: - Priming hook (engine-settable threshold multiplier)
+
+    func testPrimingMultiplierLowersEffectiveThresholdAndSetsWasPrimed() throws {
+        // Amplitude 0.11 → RMS ≈ 0.0778 → dBFS ≈ -22.2, which is BELOW the
+        // base threshold of -20 (would not trigger unprimed — verified by
+        // the existing testAmplitudeJustBelowDbfsThresholdDoesNotTrigger).
+        //
+        // With primingMultiplier = 0.75, the effective threshold becomes
+        // -20 + 20·log10(0.75) ≈ -22.5, so -22.2 is above effective → triggers.
+        let (d, c) = makeDetector()
+        d.primingMultiplier = 0.75
+        feed(d, AudioFixtures.sine(frequency: 1_000, amplitude: 0.11, durationMs: 500))
+        XCTAssertEqual(c.triggers.count, 1, "priming should lower threshold enough for amplitude 0.11 to trigger")
+        XCTAssertTrue(
+            try XCTUnwrap(c.triggers.first).wasPrimed,
+            "firing that only happened because of priming must carry wasPrimed=true"
+        )
+    }
+
+    func testPrimingMultiplierDoesNotSetWasPrimedWhenFiringWouldHaveHappenedAnyway() throws {
+        // Amplitude 0.5 → dBFS ≈ -9, well above both base (-20) and
+        // primed-at-0.75 (-22.5). Priming didn't affect whether this fires.
+        let (d, c) = makeDetector()
+        d.primingMultiplier = 0.75
+        feed(d, AudioFixtures.sine(frequency: 1_000, amplitude: 0.5, durationMs: 500))
+        XCTAssertEqual(c.triggers.count, 1)
+        XCTAssertFalse(
+            try XCTUnwrap(c.triggers.first).wasPrimed,
+            "a firing that would have happened without priming must carry wasPrimed=false"
+        )
+    }
+
     // MARK: - Intensity signal
 
     func testIntensitySignalEmittedExactlyOncePerBuffer() throws {
