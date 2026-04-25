@@ -79,6 +79,16 @@ public final class AccelerometerDetector: Detector {
     /// can reach back to `self` without unsafe self-casts.
     private var callbackContext: UnsafeMutableRawPointer?
 
+    /// Devices we've installed per-device input-report callbacks on. Tracked
+    /// so we can unregister + close on stop().
+    private var attachedDevices: [IOHIDDevice] = []
+
+    /// Per-device report buffers. IOKit writes incoming reports here before
+    /// invoking the callback; the buffer must outlive the registration.
+    private var reportBuffers: [UnsafeMutablePointer<UInt8>] = []
+
+    private static let reportBufferSize = 64
+
     // MARK: - Init
 
     public init(config: DeskBangConfig) {
@@ -94,6 +104,7 @@ public final class AccelerometerDetector: Detector {
 
     public func start() throws {
         stop()
+        FileHandle.standardError.write(Data("[diag] AccelerometerDetector.start() entered (per-device path)\n".utf8))
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 
         let match: [String: Any] = [
@@ -121,7 +132,7 @@ public final class AccelerometerDetector: Detector {
 
         // Verify a matching device is actually present. If the matching-set
         // is empty after open, there's no accelerometer on this Mac.
-        let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> ?? []
+        let devices = Array(IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> ?? [])
         guard !devices.isEmpty else {
             IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
             throw DetectorError.hardwareUnavailable(
@@ -138,17 +149,91 @@ public final class AccelerometerDetector: Detector {
         let context = UnsafeMutableRawPointer(box.toOpaque())
         self.callbackContext = context
 
-        IOHIDManagerRegisterInputReportCallback(
-            manager,
-            Self.inputReportCallback,
-            context
-        )
+        // Diagnostic: log what we matched. Helps debug "started but no
+        // reports arrive" cases — if we matched the wrong device, the
+        // product/usage will tell us. One-shot (only on start), so the
+        // overhead is negligible.
+        Self.logMatchedDevices(devices)
+
+        // Per-device input-report callback path. Manager-level
+        // `IOHIDManagerRegisterInputReportCallback` (3-arg modern signature)
+        // is documented to forward reports from any matched device, but in
+        // practice the AppleSPUHIDDevice doesn't deliver through it.
+        // Per-device registration with explicit buffer + explicit per-device
+        // run-loop scheduling matches what every reverse-engineered
+        // reference does, and it's what actually delivers reports.
+        for device in devices {
+            // Manager-level open should open all matched devices, but on
+            // some drivers the per-device callback only fires after an
+            // explicit `IOHIDDeviceOpen`. Failing this is non-fatal —
+            // the manager-level open may already cover us.
+            let deviceOpenResult = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            if deviceOpenResult != kIOReturnSuccess {
+                FileHandle.standardError.write(Data(
+                    "[diag] IOHIDDeviceOpen returned 0x\(String(deviceOpenResult, radix: 16)) — continuing\n".utf8
+                ))
+            }
+
+            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Self.reportBufferSize)
+            buffer.initialize(repeating: 0, count: Self.reportBufferSize)
+            IOHIDDeviceRegisterInputReportCallback(
+                device,
+                buffer,
+                CFIndex(Self.reportBufferSize),
+                Self.inputReportCallback,
+                context
+            )
+
+            // Schedule each device individually as well. Some drivers
+            // require this in addition to the manager-level schedule.
+            IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+
+            attachedDevices.append(device)
+            reportBuffers.append(buffer)
+        }
 
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         self.hidManager = manager
     }
 
+    private static func logMatchedDevices(_ devices: [IOHIDDevice]) {
+        let header = "[diag] AccelerometerDetector matched \(devices.count) HID device(s):\n"
+        FileHandle.standardError.write(Data(header.utf8))
+        for (i, device) in devices.enumerated() {
+            let product = (IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String) ?? "?"
+            let manufacturer = (IOHIDDeviceGetProperty(device, kIOHIDManufacturerKey as CFString) as? String) ?? "?"
+            let usagePage = (IOHIDDeviceGetProperty(device, kIOHIDPrimaryUsagePageKey as CFString) as? Int) ?? -1
+            let usage = (IOHIDDeviceGetProperty(device, kIOHIDPrimaryUsageKey as CFString) as? Int) ?? -1
+            let maxReport = (IOHIDDeviceGetProperty(device, kIOHIDMaxInputReportSizeKey as CFString) as? Int) ?? -1
+            let line = String(
+                format: "[diag]   [%d] product='%@' manufacturer='%@' usagePage=0x%X usage=0x%X maxInputReportSize=%d\n",
+                i, product, manufacturer, usagePage, usage, maxReport
+            )
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+    }
+
     public func stop() {
+        // Per-device teardown: unregister callback (passing nil), unschedule
+        // from the run loop, close the device. Mirrors start() in reverse.
+        for (device, buffer) in zip(attachedDevices, reportBuffers) {
+            IOHIDDeviceRegisterInputReportCallback(
+                device,
+                buffer,
+                CFIndex(Self.reportBufferSize),
+                nil,
+                nil
+            )
+            IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
+        for buffer in reportBuffers {
+            buffer.deinitialize(count: Self.reportBufferSize)
+            buffer.deallocate()
+        }
+        attachedDevices = []
+        reportBuffers = []
+
         if let manager = hidManager {
             IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
             IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
