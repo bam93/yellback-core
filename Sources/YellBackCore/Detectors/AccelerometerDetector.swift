@@ -110,10 +110,17 @@ public final class AccelerometerDetector: Detector {
 
     public func start() throws {
         stop()
-        FileHandle.standardError.write(Data("[diag] AccelerometerDetector.start() entered (per-device path, seize)\n".utf8))
-        // Reset the first-report sentinel so we get one diag line when reports
-        // actually start arriving from this `start()` invocation.
+        FileHandle.standardError.write(Data("[diag] AccelerometerDetector.start() entered (wake + manager-only)\n".utf8))
         firstReportSeen = false
+
+        // M2/M3/M4 SPU sensors ship in an idle state: PowerState=0,
+        // ReportingState=0. Until the driver is "woken" by setting three
+        // IORegistry properties, the HID device matches and opens cleanly
+        // but never delivers reports. M1 / M1 Pro happen to be woken by
+        // the OS's lid-angle service so this step was implicit. Newer
+        // chips need it explicitly.
+        Self.wakeSPUDriver()
+
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 
         let match: [String: Any] = [
@@ -123,11 +130,18 @@ public final class AccelerometerDetector: Detector {
         ]
         IOHIDManagerSetDeviceMatching(manager, match as CFDictionary)
 
-        // Seize the device for exclusive HID access. Without seize the OS can
-        // intercept the reports before we see them — likely what was
-        // happening on M2 (sensor matched, manager opened, but reports never
-        // reached our callback).
-        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
+        // Schedule the manager with the main run loop BEFORE opening. The
+        // working reverse-engineered references (OpenSlap, olvvier) all
+        // schedule first; opening before scheduling has been observed to
+        // race the first reports out the window.
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+
+        // Open WITHOUT seize. On M2/M3/M4, kIOHIDOptionsTypeSeizeDevice
+        // evicts the other SPU consumers (e.g. lid-angle service) that
+        // were keeping the sensor woken, and the report stream silently
+        // dies. kIOHIDOptionsTypeNone keeps the sensor awake and lets us
+        // co-receive reports.
+        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         switch openResult {
         case kIOReturnSuccess:
             break
@@ -168,26 +182,14 @@ public final class AccelerometerDetector: Detector {
         // overhead is negligible.
         Self.logMatchedDevices(devices)
 
-        // Per-device input-report callback path. Manager-level
-        // `IOHIDManagerRegisterInputReportCallback` (3-arg modern signature)
-        // is documented to forward reports from any matched device, but in
-        // practice the AppleSPUHIDDevice doesn't deliver through it.
-        // Per-device registration with explicit buffer + explicit per-device
-        // run-loop scheduling matches what every reverse-engineered
-        // reference does, and it's what actually delivers reports.
+        // Per-device input-report callback registration. The 3-arg modern
+        // `IOHIDManagerRegisterInputReportCallback` doesn't deliver for
+        // AppleSPUHIDDevice; per-device registration with an explicit
+        // buffer is what works. Do NOT call `IOHIDDeviceOpen` or
+        // `IOHIDDeviceScheduleWithRunLoop` — the manager-level open and
+        // schedule already cover the matched devices, and double-opening
+        // has been seen to break the report stream on M3/M4.
         for device in devices {
-            // Manager-level open should open all matched devices, but on
-            // some drivers the per-device callback only fires after an
-            // explicit `IOHIDDeviceOpen`. Failing this is non-fatal —
-            // the manager-level open may already cover us. Seize to match
-            // the manager's seize.
-            let deviceOpenResult = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
-            if deviceOpenResult != kIOReturnSuccess {
-                FileHandle.standardError.write(Data(
-                    "[diag] IOHIDDeviceOpen returned 0x\(String(deviceOpenResult, radix: 16)) — continuing\n".utf8
-                ))
-            }
-
             let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Self.reportBufferSize)
             buffer.initialize(repeating: 0, count: Self.reportBufferSize)
             IOHIDDeviceRegisterInputReportCallback(
@@ -197,17 +199,59 @@ public final class AccelerometerDetector: Detector {
                 Self.inputReportCallback,
                 context
             )
-
-            // Schedule each device individually as well. Some drivers
-            // require this in addition to the manager-level schedule.
-            IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-
             attachedDevices.append(device)
             reportBuffers.append(buffer)
         }
 
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         self.hidManager = manager
+    }
+
+    /// Wakes the AppleSPUHIDDriver IORegistry node so the sensor delivers
+    /// HID input reports. On M2/M3/M4 the SPU sensor sits in an idle state
+    /// (PowerState=0, ReportingState=0) until something explicitly bumps
+    /// these properties. M1 / M1 Pro Macs happen to have a system service
+    /// (lid-angle / orientation) that does this implicitly, which is why
+    /// older devices "just worked" with kIOHIDOptionsTypeNone but newer
+    /// ones don't.
+    ///
+    /// Properties set:
+    ///   - SensorPropertyReportingState = 1  (start delivering reports)
+    ///   - SensorPropertyPowerState     = 1  (power on the sensor)
+    ///   - ReportInterval               = 1000 microseconds (1 kHz)
+    ///
+    /// Idempotent — calling repeatedly is harmless.
+    private static func wakeSPUDriver() {
+        guard let matching = IOServiceMatching("AppleSPUHIDDriver") else {
+            FileHandle.standardError.write(Data("[diag] IOServiceMatching(\"AppleSPUHIDDriver\") returned nil\n".utf8))
+            return
+        }
+        var iterator: io_iterator_t = 0
+        let getResult = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator)
+        guard getResult == kIOReturnSuccess else {
+            FileHandle.standardError.write(Data(
+                "[diag] IOServiceGetMatchingServices returned 0x\(String(getResult, radix: 16))\n".utf8
+            ))
+            return
+        }
+        defer { IOObjectRelease(iterator) }
+
+        var wokenCount = 0
+        while true {
+            let service = IOIteratorNext(iterator)
+            guard service != 0 else { break }
+            defer { IOObjectRelease(service) }
+
+            let one = 1 as CFNumber
+            let interval = 1000 as CFNumber  // microseconds → 1 kHz request
+            IORegistryEntrySetCFProperty(service, "SensorPropertyReportingState" as CFString, one)
+            IORegistryEntrySetCFProperty(service, "SensorPropertyPowerState"     as CFString, one)
+            IORegistryEntrySetCFProperty(service, "ReportInterval"               as CFString, interval)
+            wokenCount += 1
+        }
+
+        FileHandle.standardError.write(Data(
+            "[diag] AppleSPUHIDDriver: woke \(wokenCount) IORegistry entrie(s)\n".utf8
+        ))
     }
 
     private static func logMatchedDevices(_ devices: [IOHIDDevice]) {
@@ -228,8 +272,10 @@ public final class AccelerometerDetector: Detector {
     }
 
     public func stop() {
-        // Per-device teardown: unregister callback (passing nil), unschedule
-        // from the run loop, close the device. Mirrors start() in reverse.
+        // Per-device teardown: unregister callback by passing nil. We never
+        // called IOHIDDeviceOpen / IOHIDDeviceScheduleWithRunLoop, so don't
+        // call the matching teardowns either — the manager-level close
+        // covers them.
         for (device, buffer) in zip(attachedDevices, reportBuffers) {
             IOHIDDeviceRegisterInputReportCallback(
                 device,
@@ -238,8 +284,6 @@ public final class AccelerometerDetector: Detector {
                 nil,
                 nil
             )
-            IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-            IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
         }
         for buffer in reportBuffers {
             buffer.deinitialize(count: Self.reportBufferSize)
