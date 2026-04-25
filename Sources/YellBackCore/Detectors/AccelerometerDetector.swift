@@ -89,6 +89,12 @@ public final class AccelerometerDetector: Detector {
 
     private static let reportBufferSize = 64
 
+    /// One-shot diagnostic flag: prints a single "[diag] first report" line
+    /// the first time the IOKit callback delivers a report after `start()`.
+    /// Reset on each `start()`. Helps confirm the C-callback path is alive
+    /// without flooding stderr.
+    private var firstReportSeen = false
+
     // MARK: - Init
 
     public init(config: DeskBangConfig) {
@@ -104,7 +110,10 @@ public final class AccelerometerDetector: Detector {
 
     public func start() throws {
         stop()
-        FileHandle.standardError.write(Data("[diag] AccelerometerDetector.start() entered (per-device path)\n".utf8))
+        FileHandle.standardError.write(Data("[diag] AccelerometerDetector.start() entered (per-device path, seize)\n".utf8))
+        // Reset the first-report sentinel so we get one diag line when reports
+        // actually start arriving from this `start()` invocation.
+        firstReportSeen = false
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 
         let match: [String: Any] = [
@@ -114,7 +123,11 @@ public final class AccelerometerDetector: Detector {
         ]
         IOHIDManagerSetDeviceMatching(manager, match as CFDictionary)
 
-        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        // Seize the device for exclusive HID access. Without seize the OS can
+        // intercept the reports before we see them — likely what was
+        // happening on M2 (sensor matched, manager opened, but reports never
+        // reached our callback).
+        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
         switch openResult {
         case kIOReturnSuccess:
             break
@@ -166,8 +179,9 @@ public final class AccelerometerDetector: Detector {
             // Manager-level open should open all matched devices, but on
             // some drivers the per-device callback only fires after an
             // explicit `IOHIDDeviceOpen`. Failing this is non-fatal —
-            // the manager-level open may already cover us.
-            let deviceOpenResult = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            // the manager-level open may already cover us. Seize to match
+            // the manager's seize.
+            let deviceOpenResult = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
             if deviceOpenResult != kIOReturnSuccess {
                 FileHandle.standardError.write(Data(
                     "[diag] IOHIDDeviceOpen returned 0x\(String(deviceOpenResult, radix: 16)) — continuing\n".utf8
@@ -250,6 +264,17 @@ public final class AccelerometerDetector: Detector {
     /// Primary detection entry point. Called from the HID callback at
     /// runtime, or directly from tests with synthesised samples.
     func process(sample: AccelerometerSample) {
+        // Fire the first-report diag *before* the isEnabled gate. We want to
+        // know whether IOKit is delivering, regardless of whether the user
+        // disabled the detector via runtime toggle.
+        if !firstReportSeen {
+            firstReportSeen = true
+            FileHandle.standardError.write(Data(
+                String(format: "[diag] first desk_bang report received: x=%.4f y=%.4f z=%.4f\n",
+                       sample.x, sample.y, sample.z).utf8
+            ))
+        }
+
         guard isEnabled else { return }
 
         // The accelerometer at rest reads magnitude ~1g (gravity). Detect
