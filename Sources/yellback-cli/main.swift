@@ -137,6 +137,7 @@ if config.triggers.scream.enabled {
 
 if config.triggers.deskBang.enabled {
     let d = AccelerometerDetector(config: config.triggers.deskBang)
+    d.verboseDiagnostics = (config.logging.level == .debug)
     d.onTriggerEvent = { event in writeStderr(formatTriggerLine(event)) }
     if config.logging.level == .debug {
         d.onIntensitySignal = { sig in

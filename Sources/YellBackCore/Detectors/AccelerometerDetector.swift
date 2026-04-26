@@ -89,11 +89,11 @@ public final class AccelerometerDetector: Detector {
 
     private static let reportBufferSize = 64
 
-    /// One-shot diagnostic flag: prints a single "[diag] first report" line
-    /// the first time the IOKit callback delivers a report after `start()`.
-    /// Reset on each `start()`. Helps confirm the C-callback path is alive
-    /// without flooding stderr.
-    private var firstReportSeen = false
+    /// When `true`, `start()` prints diagnostic information to stderr:
+    /// the wake-count, matched-device list with their HID properties.
+    /// CLI consumers should set this to `true` when running under
+    /// `logging.level == .debug`. Default `false`.
+    public var verboseDiagnostics: Bool = false
 
     // MARK: - Init
 
@@ -110,8 +110,6 @@ public final class AccelerometerDetector: Detector {
 
     public func start() throws {
         stop()
-        FileHandle.standardError.write(Data("[diag] AccelerometerDetector.start() entered (wake + manager-only)\n".utf8))
-        firstReportSeen = false
 
         // M2/M3/M4 SPU sensors ship in an idle state: PowerState=0,
         // ReportingState=0. Until the driver is "woken" by setting three
@@ -119,7 +117,7 @@ public final class AccelerometerDetector: Detector {
         // but never delivers reports. M1 / M1 Pro happen to be woken by
         // the OS's lid-angle service so this step was implicit. Newer
         // chips need it explicitly.
-        Self.wakeSPUDriver()
+        Self.wakeSPUDriver(verbose: verboseDiagnostics)
 
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 
@@ -176,11 +174,9 @@ public final class AccelerometerDetector: Detector {
         let context = UnsafeMutableRawPointer(box.toOpaque())
         self.callbackContext = context
 
-        // Diagnostic: log what we matched. Helps debug "started but no
-        // reports arrive" cases — if we matched the wrong device, the
-        // product/usage will tell us. One-shot (only on start), so the
-        // overhead is negligible.
-        Self.logMatchedDevices(devices)
+        if verboseDiagnostics {
+            Self.logMatchedDevices(devices)
+        }
 
         // Per-device input-report callback registration. The 3-arg modern
         // `IOHIDManagerRegisterInputReportCallback` doesn't deliver for
@@ -220,17 +216,21 @@ public final class AccelerometerDetector: Detector {
     ///   - ReportInterval               = 1000 microseconds (1 kHz)
     ///
     /// Idempotent — calling repeatedly is harmless.
-    private static func wakeSPUDriver() {
+    private static func wakeSPUDriver(verbose: Bool) {
         guard let matching = IOServiceMatching("AppleSPUHIDDriver") else {
-            FileHandle.standardError.write(Data("[diag] IOServiceMatching(\"AppleSPUHIDDriver\") returned nil\n".utf8))
+            if verbose {
+                FileHandle.standardError.write(Data("[diag] IOServiceMatching(\"AppleSPUHIDDriver\") returned nil\n".utf8))
+            }
             return
         }
         var iterator: io_iterator_t = 0
         let getResult = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator)
         guard getResult == kIOReturnSuccess else {
-            FileHandle.standardError.write(Data(
-                "[diag] IOServiceGetMatchingServices returned 0x\(String(getResult, radix: 16))\n".utf8
-            ))
+            if verbose {
+                FileHandle.standardError.write(Data(
+                    "[diag] IOServiceGetMatchingServices returned 0x\(String(getResult, radix: 16))\n".utf8
+                ))
+            }
             return
         }
         defer { IOObjectRelease(iterator) }
@@ -249,9 +249,11 @@ public final class AccelerometerDetector: Detector {
             wokenCount += 1
         }
 
-        FileHandle.standardError.write(Data(
-            "[diag] AppleSPUHIDDriver: woke \(wokenCount) IORegistry entrie(s)\n".utf8
-        ))
+        if verbose {
+            FileHandle.standardError.write(Data(
+                "[diag] AppleSPUHIDDriver: woke \(wokenCount) IORegistry entrie(s)\n".utf8
+            ))
+        }
     }
 
     private static func logMatchedDevices(_ devices: [IOHIDDevice]) {
@@ -308,17 +310,6 @@ public final class AccelerometerDetector: Detector {
     /// Primary detection entry point. Called from the HID callback at
     /// runtime, or directly from tests with synthesised samples.
     func process(sample: AccelerometerSample) {
-        // Fire the first-report diag *before* the isEnabled gate. We want to
-        // know whether IOKit is delivering, regardless of whether the user
-        // disabled the detector via runtime toggle.
-        if !firstReportSeen {
-            firstReportSeen = true
-            FileHandle.standardError.write(Data(
-                String(format: "[diag] first desk_bang report received: x=%.4f y=%.4f z=%.4f\n",
-                       sample.x, sample.y, sample.z).utf8
-            ))
-        }
-
         guard isEnabled else { return }
 
         // The accelerometer at rest reads magnitude ~1g (gravity). Detect
