@@ -25,22 +25,12 @@ func printUsage(_ fh: FileHandle) {
 
 // MARK: - Trigger rendering
 
-/// Render a `Trigger` in the snake_case vocabulary of CONFIG_SCHEMA.md /
-/// config.example.yaml. Matches what users see in their editor.
-func snakeCaseName(for trigger: Trigger) -> String {
-    switch trigger {
-    case .scream: return "scream"
-    case .rageType: return "rage_type"
-    case .deskBang: return "desk_bang"
-    }
-}
-
 /// Human-readable per-trigger line. Derives the detector-specific unit
 /// (dBFS or g-force) from the `intensity` scalar using the inverse of the
 /// linear intensity mapping each detector applies. These are approximate —
 /// the underlying detectors don't currently surface the raw measurement.
 func formatTriggerLine(_ event: TriggerEvent) -> String {
-    let name = snakeCaseName(for: event.trigger).padding(toLength: 10, withPad: " ", startingAt: 0)
+    let name = event.trigger.snakeCaseName.padding(toLength: 10, withPad: " ", startingAt: 0)
     let detail: String
     switch event.trigger {
     case .scream:
@@ -158,7 +148,7 @@ if config.triggers.rageType.enabled {
 var startedDetectors: [Detector] = []
 
 for d in detectors {
-    let name = snakeCaseName(for: d.trigger)
+    let name = d.trigger.snakeCaseName
     do {
         try d.start()
         writeStderr("  triggers.\(name): started")

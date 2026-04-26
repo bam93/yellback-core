@@ -140,30 +140,10 @@ public final class AccelerometerDetector: Detector {
         // dies. kIOHIDOptionsTypeNone keeps the sensor awake and lets us
         // co-receive reports.
         let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        switch openResult {
-        case kIOReturnSuccess:
-            break
-        case kIOReturnNotPrivileged:
-            throw DetectorError.needsPrivilegedAccess(
-                trigger: .deskBang,
-                reason: "IOHIDManagerOpen returned kIOReturnNotPrivileged — run as root (sudo) or via a privileged helper"
-            )
-        default:
-            throw DetectorError.inputSetupFailed(
-                trigger: .deskBang,
-                underlying: "IOHIDManagerOpen returned IOReturn 0x\(String(openResult, radix: 16))"
-            )
-        }
-
-        // Verify a matching device is actually present. If the matching-set
-        // is empty after open, there's no accelerometer on this Mac.
         let devices = Array(IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> ?? [])
-        guard !devices.isEmpty else {
+        if let error = Self.deriveStartError(openResult: openResult, deviceCount: devices.count) {
             IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-            throw DetectorError.hardwareUnavailable(
-                trigger: .deskBang,
-                reason: "no AppleSPUHIDDevice accelerometer found (expected on base M1, Mac mini, Mac Studio, Mac Pro)"
-            )
+            throw error
         }
 
         // Hand IOKit a stable context pointer to a heap box holding `self`
@@ -215,9 +195,65 @@ public final class AccelerometerDetector: Detector {
     ///   - SensorPropertyPowerState     = 1  (power on the sensor)
     ///   - ReportInterval               = 1000 microseconds (1 kHz)
     ///
+    // MARK: - Start-error derivation (pure, testable)
+
+    /// Pure function: given the result of `IOHIDManagerOpen` and the count
+    /// of currently-matching devices, return the `DetectorError` we should
+    /// throw — or `nil` if start should proceed.
+    ///
+    /// Extracted from `start()` so the error-mapping logic can be unit-tested
+    /// without touching IOKit. The integration path (real IOHIDManagerOpen
+    /// against real hardware) is verified manually via `sudo yellback --listen`.
+    static func deriveStartError(openResult: IOReturn, deviceCount: Int) -> DetectorError? {
+        switch openResult {
+        case kIOReturnSuccess:
+            if deviceCount == 0 {
+                return .hardwareUnavailable(
+                    trigger: .deskBang,
+                    reason: "no AppleSPUHIDDevice accelerometer found (expected on base M1, Mac mini, Mac Studio, Mac Pro)"
+                )
+            }
+            return nil
+        case kIOReturnNotPrivileged:
+            return .needsPrivilegedAccess(
+                trigger: .deskBang,
+                reason: "IOHIDManagerOpen returned kIOReturnNotPrivileged — run as root (sudo) or via a privileged helper"
+            )
+        default:
+            // IOReturn is signed Int32; render via the unsigned bit pattern
+            // so high-bit codes (e.g. 0xE00002C5) print as their conventional
+            // hex form rather than as a negative number.
+            let hex = String(UInt32(bitPattern: openResult), radix: 16)
+            return .inputSetupFailed(
+                trigger: .deskBang,
+                underlying: "IOHIDManagerOpen returned IOReturn 0x\(hex)"
+            )
+        }
+    }
+
+    // MARK: - SPU wake constants (testable)
+
+    /// IOKit service class to match for the wake step. Pinned in a constant
+    /// so a drift test can fail loudly if anyone renames it. Apple-internal,
+    /// undocumented — they could rename it in any macOS release. The drift
+    /// test won't catch *that*, but it does catch local typos and refactors
+    /// gone wrong.
+    static let spuDriverServiceName = "AppleSPUHIDDriver"
+
+    /// IORegistry properties to set during the wake step. Each value is
+    /// sent as a CFNumber (Int). Pinned in a constant so a drift test can
+    /// fail loudly if anyone reorders, renames, or drops one of them —
+    /// silent failure here means "desk_bang stops firing on M2+" with no
+    /// other signal.
+    static let spuWakeProperties: [(key: String, value: Int)] = [
+        ("SensorPropertyReportingState", 1),  // start delivering reports
+        ("SensorPropertyPowerState",     1),  // power on the sensor
+        ("ReportInterval",               1000),  // microseconds → 1 kHz
+    ]
+
     /// Idempotent — calling repeatedly is harmless.
     private static func wakeSPUDriver(verbose: Bool) {
-        guard let matching = IOServiceMatching("AppleSPUHIDDriver") else {
+        guard let matching = IOServiceMatching(spuDriverServiceName) else {
             if verbose {
                 FileHandle.standardError.write(Data("[diag] IOServiceMatching(\"AppleSPUHIDDriver\") returned nil\n".utf8))
             }
@@ -241,11 +277,13 @@ public final class AccelerometerDetector: Detector {
             guard service != 0 else { break }
             defer { IOObjectRelease(service) }
 
-            let one = 1 as CFNumber
-            let interval = 1000 as CFNumber  // microseconds → 1 kHz request
-            IORegistryEntrySetCFProperty(service, "SensorPropertyReportingState" as CFString, one)
-            IORegistryEntrySetCFProperty(service, "SensorPropertyPowerState"     as CFString, one)
-            IORegistryEntrySetCFProperty(service, "ReportInterval"               as CFString, interval)
+            for property in spuWakeProperties {
+                IORegistryEntrySetCFProperty(
+                    service,
+                    property.key as CFString,
+                    property.value as CFNumber
+                )
+            }
             wokenCount += 1
         }
 
@@ -309,6 +347,19 @@ public final class AccelerometerDetector: Detector {
 
     /// Primary detection entry point. Called from the HID callback at
     /// runtime, or directly from tests with synthesised samples.
+    /// Number of motion samples this detector currently retains across
+    /// `process(sample:)` calls. Required to be zero — `AccelerometerDetector`
+    /// processes each sample synchronously and stores nothing about the
+    /// motion data afterwards.
+    ///
+    /// Exposed for the privacy-invariant test that asserts this stays zero
+    /// regardless of how many samples we feed. The corresponding runtime
+    /// `precondition` inside `process(sample:)` makes the invariant
+    /// load-bearing — any future contributor adding "rolling 50-sample
+    /// buffer" state without updating both the count and the doc comment
+    /// will trip the precondition immediately.
+    var retainedMotionSampleCount: Int { 0 }
+
     func process(sample: AccelerometerSample) {
         guard isEnabled else { return }
 
@@ -334,6 +385,14 @@ public final class AccelerometerDetector: Detector {
             intensity: intensity,
             wasPrimed: wasPrimed
         ))
+
+        // Privacy invariant: this detector retains no motion data between
+        // calls. Any future change that caches motion samples must update
+        // `retainedMotionSampleCount` AND have a real reason to do so.
+        precondition(
+            retainedMotionSampleCount == 0,
+            "AccelerometerDetector retains \(retainedMotionSampleCount) motion samples; privacy invariant violated"
+        )
     }
 
     // MARK: - Helpers

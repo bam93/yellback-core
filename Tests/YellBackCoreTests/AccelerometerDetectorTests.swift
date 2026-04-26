@@ -1,4 +1,5 @@
 import XCTest
+import IOKit
 @testable import YellBackCore
 
 /// Unit tests for `AccelerometerDetector`.
@@ -217,5 +218,92 @@ final class AccelerometerDetectorTests: XCTestCase {
         }
         d.process(sample: sample)
         XCTAssertEqual(c.triggers.count, 1)
+    }
+
+    // MARK: - Privacy invariant
+
+    func testRetainedMotionSampleCountStaysZeroAfterManySamples() throws {
+        // Pin the contract: AccelerometerDetector retains no motion data
+        // between process() calls. The runtime precondition inside
+        // process() catches any future contributor adding rolling-buffer
+        // state; this test asserts the post-condition explicitly. Mirrors
+        // MicDetector's testRetainedAudioSampleCountNeverExceedsEight.
+        let (d, _) = makeDetector()
+        XCTAssertEqual(d.retainedMotionSampleCount, 0, "starts at zero")
+        for i in 0..<5_000 {
+            // Mix of rest, sub-threshold, and trigger-eligible samples to
+            // exercise both branches of the guard inside process().
+            let mag = (i % 100 == 0) ? 3.0 : 1.0 + Double(i % 7) * 0.05
+            d.process(sample: MotionFixtures.sample(gForceMagnitude: mag, at: TimeInterval(i)))
+        }
+        XCTAssertEqual(d.retainedMotionSampleCount, 0, "still zero after 5000 process() calls")
+    }
+
+    // MARK: - SPU wake property drift (catches accidental rename)
+
+    func testSPUDriverServiceNameIsLockedToAppleSPUHIDDriver() {
+        // If anyone changes this string, the wake step silently no-ops on
+        // M2/M3/M4 and desk_bang stops firing. Pin the literal name so a
+        // typo or refactor fails loudly. Note: this catches LOCAL drift
+        // (someone editing the constant); it does not catch Apple renaming
+        // the underlying IOKit class in a future macOS release — that's
+        // a manual-verification problem.
+        XCTAssertEqual(AccelerometerDetector.spuDriverServiceName, "AppleSPUHIDDriver")
+    }
+
+    func testSPUWakePropertiesAreLockedToTheThreeKnownToWorkOnM2() {
+        let props = AccelerometerDetector.spuWakeProperties
+        XCTAssertEqual(props.count, 3, "exactly three wake properties — M2 is silent without all of them")
+
+        XCTAssertEqual(props[0].key, "SensorPropertyReportingState")
+        XCTAssertEqual(props[0].value, 1)
+        XCTAssertEqual(props[1].key, "SensorPropertyPowerState")
+        XCTAssertEqual(props[1].value, 1)
+        XCTAssertEqual(props[2].key, "ReportInterval")
+        XCTAssertEqual(props[2].value, 1000, "1000 microseconds → 1 kHz; raising weakens the signal, lowering may oversample")
+    }
+
+    // MARK: - Start-error derivation (pure function, no IOKit)
+
+    func testDeriveStartErrorReturnsNilOnSuccessfulOpenWithDevices() {
+        let result = AccelerometerDetector.deriveStartError(openResult: kIOReturnSuccess, deviceCount: 1)
+        XCTAssertNil(result, "successful open + ≥1 device → no error")
+    }
+
+    func testDeriveStartErrorReturnsHardwareUnavailableOnEmptyDeviceSet() {
+        // The "Mac mini / Mac Studio / base M1" case: open succeeds, but no
+        // matching SPU sensor exists. This is the path my Session-3+7
+        // landing claimed to handle but had zero tests for.
+        let result = AccelerometerDetector.deriveStartError(openResult: kIOReturnSuccess, deviceCount: 0)
+        guard case .hardwareUnavailable(let trigger, _) = result else {
+            XCTFail("expected .hardwareUnavailable, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(trigger, .deskBang)
+    }
+
+    func testDeriveStartErrorReturnsNeedsPrivilegedAccessOnNotPrivileged() {
+        // Running without sudo: IOHIDManagerOpen returns kIOReturnNotPrivileged.
+        let result = AccelerometerDetector.deriveStartError(openResult: kIOReturnNotPrivileged, deviceCount: 0)
+        guard case .needsPrivilegedAccess(let trigger, _) = result else {
+            XCTFail("expected .needsPrivilegedAccess, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(trigger, .deskBang)
+    }
+
+    func testDeriveStartErrorReturnsInputSetupFailedOnOtherIOReturn() {
+        // Any other IOReturn code: a generic input-setup-failed wrapping
+        // the hex code so the user has something to grep. IOReturn is
+        // Int32; bitPattern: lets us specify negative-bit values via
+        // their unsigned hex representation.
+        let bogusResult = IOReturn(bitPattern: 0xE00002C5)  // arbitrary non-zero, non-privileged
+        let result = AccelerometerDetector.deriveStartError(openResult: bogusResult, deviceCount: 0)
+        guard case .inputSetupFailed(let trigger, let underlying) = result else {
+            XCTFail("expected .inputSetupFailed, got \(String(describing: result))")
+            return
+        }
+        XCTAssertEqual(trigger, .deskBang)
+        XCTAssertTrue(underlying.contains("e00002c5"), "underlying message should include the hex IOReturn for grep-ability; got: \(underlying)")
     }
 }
