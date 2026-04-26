@@ -82,13 +82,62 @@ guard shouldListen else {
 
 writeStderr("yellback: listening with config \(configURL.path)")
 
+// MARK: - Bring up the audio engine + load the bundled Crowd pack
+
+import AVFoundation
+
+let soundEngine: SoundEngine?
+do {
+    let engine = try SoundEngine()
+    engine.verboseDiagnostics = (config.logging.level == .debug)
+    engine.masterVolume = config.audio.masterVolume
+
+    // Load the bundled Crowd pack from the repo's Resources tree. In the
+    // dev path (`swift run yellback ...` from the repo root), this is
+    // simply `./Resources/Packs/crowd/`. A future packaged release will
+    // resolve via `Bundle.module` once Package.swift declares the
+    // resources properly — see PROGRESS.md known issue.
+    let crowdDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("Resources/Packs/crowd")
+    if FileManager.default.fileExists(atPath: crowdDir.appendingPathComponent("pack.yaml").path) {
+        do {
+            let outputFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 44_100,
+                channels: 2,
+                interleaved: false
+            )!
+            let pack = try PackLoader.load(from: crowdDir, outputFormat: outputFormat)
+            engine.setPack(pack)
+            writeStderr("  audio: loaded pack '\(pack.id)' from \(crowdDir.path)")
+        } catch {
+            writeStderr("  audio: failed to load Crowd pack — \(error). Triggers will fire silently.")
+        }
+    } else {
+        writeStderr("  audio: no bundled Crowd pack at \(crowdDir.path); triggers fire silently. (Run `swift Scripts/generate_placeholder_clips.swift` to make placeholders.)")
+    }
+
+    soundEngine = engine
+} catch {
+    writeStderr("  audio: SoundEngine failed to start — \(error). Triggers will fire silently.")
+    soundEngine = nil
+}
+
+/// Closure consumed by detector `onTriggerEvent` callbacks: log the event
+/// AND drive the audio engine. Captured separately so both detectors get
+/// the same wiring without duplicating the body.
+let dispatchTrigger: (TriggerEvent) -> Void = { event in
+    writeStderr(event.consoleLogLine)
+    soundEngine?.play(intensity: event.intensity)
+}
+
 /// Build the set of detectors to start, in declaration order. Disabled
 /// detectors get a heads-up line and then aren't instantiated.
 var detectors: [Detector] = []
 
 if config.triggers.scream.enabled {
     let d = MicDetector(config: config.triggers.scream)
-    d.onTriggerEvent = { event in writeStderr(event.consoleLogLine) }
+    d.onTriggerEvent = dispatchTrigger
     if config.logging.level == .debug {
         d.onIntensitySignal = { sig in
             writeStderr(String(format: "[intensity] scream     %.3f", sig.value))
@@ -102,7 +151,7 @@ if config.triggers.scream.enabled {
 if config.triggers.deskBang.enabled {
     let d = AccelerometerDetector(config: config.triggers.deskBang)
     d.verboseDiagnostics = (config.logging.level == .debug)
-    d.onTriggerEvent = { event in writeStderr(event.consoleLogLine) }
+    d.onTriggerEvent = dispatchTrigger
     if config.logging.level == .debug {
         d.onIntensitySignal = { sig in
             writeStderr(String(format: "[intensity] desk_bang  %.3f", sig.value))
@@ -152,6 +201,7 @@ sigintSource.setEventHandler {
     writeStderr("") // newline past any in-progress ^C echo
     writeStderr("stopping detectors…")
     for d in startedDetectors { d.stop() }
+    soundEngine?.stop()
     writeStderr("done.")
     exit(0)
 }
