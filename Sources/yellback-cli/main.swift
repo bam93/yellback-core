@@ -23,32 +23,6 @@ func printUsage(_ fh: FileHandle) {
     """.utf8))
 }
 
-// MARK: - Trigger rendering
-
-/// Human-readable per-trigger line. Derives the detector-specific unit
-/// (dBFS or g-force) from the `intensity` scalar using the inverse of the
-/// linear intensity mapping each detector applies. These are approximate —
-/// the underlying detectors don't currently surface the raw measurement.
-func formatTriggerLine(_ event: TriggerEvent) -> String {
-    let name = event.trigger.snakeCaseName.padding(toLength: 10, withPad: " ", startingAt: 0)
-    let detail: String
-    switch event.trigger {
-    case .scream:
-        let dbfs = event.intensity * 60 - 60
-        detail = String(format: "dbfs=%.2f", dbfs)
-    case .deskBang:
-        let gForce = event.intensity * 3 + 1
-        detail = String(format: "g_force=%.2f", gForce)
-    case .rageType:
-        detail = "keystrokes=?"
-    }
-    let primedMark = event.wasPrimed ? " (primed)" : ""
-    return String(
-        format: "[trigger] %@ intensity=%.2f  %@%@",
-        name, event.intensity, detail, primedMark
-    )
-}
-
 // MARK: - Argument parsing
 
 let args = CommandLine.arguments
@@ -114,7 +88,7 @@ var detectors: [Detector] = []
 
 if config.triggers.scream.enabled {
     let d = MicDetector(config: config.triggers.scream)
-    d.onTriggerEvent = { event in writeStderr(formatTriggerLine(event)) }
+    d.onTriggerEvent = { event in writeStderr(event.consoleLogLine) }
     if config.logging.level == .debug {
         d.onIntensitySignal = { sig in
             writeStderr(String(format: "[intensity] scream     %.3f", sig.value))
@@ -128,7 +102,7 @@ if config.triggers.scream.enabled {
 if config.triggers.deskBang.enabled {
     let d = AccelerometerDetector(config: config.triggers.deskBang)
     d.verboseDiagnostics = (config.logging.level == .debug)
-    d.onTriggerEvent = { event in writeStderr(formatTriggerLine(event)) }
+    d.onTriggerEvent = { event in writeStderr(event.consoleLogLine) }
     if config.logging.level == .debug {
         d.onIntensitySignal = { sig in
             writeStderr(String(format: "[intensity] desk_bang  %.3f", sig.value))

@@ -292,6 +292,105 @@ final class AccelerometerDetectorTests: XCTestCase {
         XCTAssertEqual(trigger, .deskBang)
     }
 
+    // MARK: - Wire format (byte-literal independent verification)
+
+    /// These tests use HARDCODED byte arrays — not constructed via
+    /// `makeReport()` — to verify `parseReport` reads from the documented
+    /// offsets and Q16.16 scale. If `parseReport` ever drifts to read
+    /// different offsets, the bytes at the new offsets will be zero (or
+    /// the deliberate metadata-noise bytes) and the assertion fails.
+    ///
+    /// Residual circularity caveat: these tests still encode the documented
+    /// scale/format. If the actual SPU hardware uses a different format on
+    /// some chip generation we haven't exercised manually, both the parser
+    /// and these tests would be wrong together. Manual verification on
+    /// real hardware is the only definitive check; the manual-verification
+    /// instructions are in PROGRESS.md.
+
+    func testParseReportReadsXAxisFromBytes6Through9() throws {
+        // Byte layout: 6 bytes of metadata noise, then X = 0x00010000 LE
+        // = 65536 = 1.0g (Q16.16). Y, Z, and trailing all zero.
+        let bytes: [UInt8] = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 0-5: metadata (deliberate noise)
+            0x00, 0x00, 0x01, 0x00,             // 6-9: X = +1.0g
+            0x00, 0x00, 0x00, 0x00,             // 10-13: Y = 0
+            0x00, 0x00, 0x00, 0x00,             // 14-17: Z = 0
+            0x00, 0x00, 0x00, 0x00,             // 18-21: trailing
+        ]
+        let sample = try Self.parseLiteralReport(bytes)
+        XCTAssertEqual(sample.x, 1.0, accuracy: 1e-4)
+        XCTAssertEqual(sample.y, 0.0, accuracy: 1e-6)
+        XCTAssertEqual(sample.z, 0.0, accuracy: 1e-6)
+    }
+
+    func testParseReportReadsYAxisFromBytes10Through13() throws {
+        let bytes: [UInt8] = [
+            0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, // 0-5: metadata
+            0x00, 0x00, 0x00, 0x00,             // 6-9: X = 0
+            0x00, 0x00, 0x01, 0x00,             // 10-13: Y = +1.0g
+            0x00, 0x00, 0x00, 0x00,             // 14-17: Z = 0
+            0x00, 0x00, 0x00, 0x00,             // 18-21: trailing
+        ]
+        let sample = try Self.parseLiteralReport(bytes)
+        XCTAssertEqual(sample.x, 0.0, accuracy: 1e-6)
+        XCTAssertEqual(sample.y, 1.0, accuracy: 1e-4)
+        XCTAssertEqual(sample.z, 0.0, accuracy: 1e-6)
+    }
+
+    func testParseReportReadsZAxisFromBytes14Through17() throws {
+        let bytes: [UInt8] = [
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, // 0-5: metadata
+            0x00, 0x00, 0x00, 0x00,             // 6-9: X = 0
+            0x00, 0x00, 0x00, 0x00,             // 10-13: Y = 0
+            0x00, 0x00, 0x01, 0x00,             // 14-17: Z = +1.0g
+            0x00, 0x00, 0x00, 0x00,             // 18-21: trailing
+        ]
+        let sample = try Self.parseLiteralReport(bytes)
+        XCTAssertEqual(sample.x, 0.0, accuracy: 1e-6)
+        XCTAssertEqual(sample.y, 0.0, accuracy: 1e-6)
+        XCTAssertEqual(sample.z, 1.0, accuracy: 1e-4)
+    }
+
+    func testParseReportDecodesNegativeValuesAsTwosComplement() throws {
+        // -1.0g = -65536 = 0xFFFF0000 in two's complement Int32. Little-
+        // endian byte order: 0x00 0x00 0xFF 0xFF.
+        let bytes: [UInt8] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xFF, 0xFF,             // X = -1.0g
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ]
+        let sample = try Self.parseLiteralReport(bytes)
+        XCTAssertEqual(sample.x, -1.0, accuracy: 1e-4)
+    }
+
+    func testParseReportHalfGForceUsesDocumentedQ1616Scale() throws {
+        // +0.5g in Q16.16 = 32768 = 0x00008000. LE: 0x00 0x80 0x00 0x00.
+        // Catches a bug where someone changes the scale factor (e.g. /32768
+        // instead of /65536) — synthesised tests would silently agree with
+        // any wrong scale, but a hardcoded byte literal pinned to the
+        // documented Q16.16 format will only round-trip correctly with the
+        // right divisor.
+        let bytes: [UInt8] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x80, 0x00, 0x00,             // X = 0.5g
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ]
+        let sample = try Self.parseLiteralReport(bytes)
+        XCTAssertEqual(sample.x, 0.5, accuracy: 1e-4)
+    }
+
+    /// Helper: invoke parseReport against a `[UInt8]` literal. Pulled out
+    /// so the per-axis tests stay focused on what they're asserting.
+    private static func parseLiteralReport(_ bytes: [UInt8]) throws -> AccelerometerSample {
+        try bytes.withUnsafeBufferPointer { buf -> AccelerometerSample in
+            try XCTUnwrap(AccelerometerDetector.parseReport(buf.baseAddress!, length: buf.count))
+        }
+    }
+
     func testDeriveStartErrorReturnsInputSetupFailedOnOtherIOReturn() {
         // Any other IOReturn code: a generic input-setup-failed wrapping
         // the hex code so the user has something to grep. IOReturn is

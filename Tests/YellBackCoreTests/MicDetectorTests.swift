@@ -247,6 +247,60 @@ final class MicDetectorTests: XCTestCase {
         XCTAssertEqual(c.intensities.count, chunks.count, "one intensity signal per process() call")
     }
 
+    // MARK: - Microphone permission resolution
+
+    /// Tests for `MicDetector.requestMicrophoneAccess(timeout:requestImpl:)`
+    /// — the seam introduced to keep `start()` from hanging in non-
+    /// interactive environments where TCC dialogs can't appear. Real
+    /// AVCaptureDevice is mocked via the `requestImpl` parameter; the
+    /// timeout / granted / denied branches are exercised in isolation
+    /// so we don't need a Mac with real TCC state to test them.
+
+    func testRequestMicrophoneAccessReturnsTrueWhenImmediatelyGranted() throws {
+        let granted = try MicDetector.requestMicrophoneAccess(timeout: 1.0) { handler in
+            handler(true)
+        }
+        XCTAssertTrue(granted)
+    }
+
+    func testRequestMicrophoneAccessReturnsFalseWhenImmediatelyDenied() throws {
+        let granted = try MicDetector.requestMicrophoneAccess(timeout: 1.0) { handler in
+            handler(false)
+        }
+        XCTAssertFalse(granted)
+    }
+
+    func testRequestMicrophoneAccessThrowsInputSetupFailedOnTimeout() {
+        // Simulate a non-interactive context where the TCC dialog never
+        // appears and the completion handler is never invoked. The
+        // underlying message should mention the timeout duration so a
+        // user grepping for "timed out" finds it.
+        XCTAssertThrowsError(
+            try MicDetector.requestMicrophoneAccess(timeout: 0.05) { _ in
+                // never call the handler
+            }
+        ) { error in
+            guard case DetectorError.inputSetupFailed(let trigger, let underlying) = error else {
+                XCTFail("expected .inputSetupFailed, got \(error)")
+                return
+            }
+            XCTAssertEqual(trigger, .scream)
+            XCTAssertTrue(underlying.contains("timed out"), "underlying message should mention the timeout for grep-ability; got: \(underlying)")
+        }
+    }
+
+    func testRequestMicrophoneAccessHonoursAsyncCallback() throws {
+        // The completion can fire from any queue. Verify the semaphore-
+        // based wait correctly hands the result back when the completion
+        // is dispatched asynchronously rather than called synchronously.
+        let granted = try MicDetector.requestMicrophoneAccess(timeout: 1.0) { handler in
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+                handler(true)
+            }
+        }
+        XCTAssertTrue(granted)
+    }
+
     // MARK: - isEnabled gate (Detector protocol)
 
     func testIsEnabledFalseSuppressesAllCallbacks() throws {

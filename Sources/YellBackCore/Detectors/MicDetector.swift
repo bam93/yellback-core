@@ -107,24 +107,26 @@ public final class MicDetector: Detector {
     public func start() throws {
         stop()
 
-        // Fail fast on explicit TCC denial so the CLI reports a clear error
-        // instead of hanging on `engine.start()` or silently delivering a
-        // silent tap. `.notDetermined` (first run) is allowed through —
-        // AVAudioEngine will either trigger a TCC prompt or return silently
-        // failed buffers depending on the host environment's signing /
-        // Info.plist state; the consumer sees empty intensity signals in
-        // the latter case and should surface that separately.
-        let authStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-        switch authStatus {
-        case .denied, .restricted:
+        // Resolve microphone permission with a hard timeout. Three cases
+        // matter:
+        //
+        //   - already granted → callback fires immediately, true
+        //   - already denied → callback fires immediately, false
+        //   - notDetermined + interactive Terminal → TCC dialog appears,
+        //     blocks until user responds, then callback fires
+        //   - notDetermined + non-interactive (CI / launchd / agent
+        //     contexts) → TCC dialog can't appear; callback may never
+        //     fire. Without a timeout we'd hang on `engine.start()` later.
+        //
+        // 2 seconds is comfortably longer than any real prompt-and-grant
+        // round trip but fast enough that a stuck non-interactive context
+        // surfaces quickly.
+        let granted = try Self.requestMicrophoneAccess(timeout: 2.0)
+        if !granted {
             throw DetectorError.needsPrivilegedAccess(
                 trigger: .scream,
-                reason: "microphone access denied (System Settings → Privacy & Security → Microphone)"
+                reason: "microphone access not granted (System Settings → Privacy & Security → Microphone)"
             )
-        case .notDetermined, .authorized:
-            break
-        @unknown default:
-            break
         }
 
         let engine = AVAudioEngine()
@@ -192,6 +194,42 @@ public final class MicDetector: Detector {
     /// `process(buffer:)` calls. Must remain `<= 8` (biquad history) at all times.
     var retainedAudioSampleCount: Int {
         voiceBandFilter.retainedSampleCount
+    }
+
+    // MARK: - Permission resolution (testable seam)
+
+    /// Resolve microphone permission with a hard timeout, returning `true`
+    /// if granted. Throws `DetectorError.inputSetupFailed` if the request
+    /// doesn't resolve within `timeout` seconds — a cue that the caller
+    /// is in a non-interactive environment without TCC dialog support.
+    ///
+    /// `requestImpl` defaults to the real `AVCaptureDevice.requestAccess`
+    /// but is overridable for tests so the timeout / granted / denied
+    /// branches can be exercised without touching the system.
+    static func requestMicrophoneAccess(
+        timeout: TimeInterval,
+        requestImpl: (@escaping (Bool) -> Void) -> Void = { handler in
+            AVCaptureDevice.requestAccess(for: .audio, completionHandler: handler)
+        }
+    ) throws -> Bool {
+        let semaphore = DispatchSemaphore(value: 0)
+        // `granted` is written from the access-completion callback (any
+        // queue) and read after `wait()` returns on this thread. The
+        // semaphore enforces happens-before, so the read is safe without
+        // explicit locking.
+        var granted = false
+        requestImpl { result in
+            granted = result
+            semaphore.signal()
+        }
+        let waitResult = semaphore.wait(timeout: .now() + timeout)
+        if waitResult == .timedOut {
+            throw DetectorError.inputSetupFailed(
+                trigger: .scream,
+                underlying: "microphone permission request timed out after \(timeout)s — likely a non-interactive environment without TCC support"
+            )
+        }
+        return granted
     }
 
     // MARK: - Detection helpers
