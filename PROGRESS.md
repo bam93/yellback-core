@@ -7,7 +7,9 @@ This file is the primary handoff artifact between Claude Code sessions. Every se
 **Session count:** 4
 **Build status:** `swift build` green (Yams 5.4.0 resolved)
 **Test status:** `swift test` green — 135 tests passing (1 scaffold + 24 ConfigLoader YAML-path + 15 ConfigValidation programmatic-path + 9 ConfigBoundary + 8 ConfigDiagnostics + 24 MicDetector + 29 AccelerometerDetector + 5 Trigger/TriggerEvent + 10 PackLoader + 10 SoundEngine)
-**Last updated:** 2026-04-24
+**Last updated:** 2026-04-26
+**Last commit on `origin/main`:** `c9d06ea` (Session 4 close-out)
+**Audio-output end-to-end verified by ear?** ❌ Not yet — see `SESSION_HANDOFF.md` for the verification command.
 
 ## Summary
 
@@ -156,6 +158,34 @@ Session 7 was folded into Session 3 (accelerometer delivered alongside the Detec
 - Priming state (Session 5)
 
 **Tentative order for later sessions:** Session 5 = wire scream+desk_bang → `YellBackEngine` + introduce `PrimingState` + engine-level cooldown filtering; Session 6 = `KeyboardDetector` (CGEventTap, needs Accessibility permission, will conform to the Detector protocol already in place).
+
+## Workflow Conventions (established across sessions)
+
+These are habits the user and Claude have settled into across Sessions 1–4. Future agents picking up this repo: follow these unless the user explicitly asks for a different approach.
+
+- **No feature branches.** Work on a worktree branch (`claude/<name>`), but at session end fast-forward `main` to it and `git push origin main` directly. The user has stated "I am not a big fan of branches. I always want to go back to main as soon as possible."
+- **Commit messages via HEREDOC**, with a one-line summary, blank line, body explaining _why_ (not just _what_), and a trailing `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` line. Match the format visible in `git log`.
+- **3–5 commits per session is the loose target.** Single big commits OK for small sessions; break into logical pieces (types → impl → tests → docs) for larger ones.
+- **Don't commit unless explicitly asked** — but the session-end checklist DOES count as an explicit ask once the user starts a session.
+- **Session-start protocol** (load-bearing — Session 3 missed this and caused issues):
+  1. Read `CLAUDE.md` (system reminder usually loads it).
+  2. Read `PROGRESS.md` in full — current state, in-flight, next-session scope.
+  3. Read any session-specific docs the user names (e.g. `AUDIO_NOTES.md` for audio sessions, `ARCHITECTURE.md` for engine sessions, `CONFIG_SCHEMA.md` for config work).
+  4. Run `swift build` and `swift test` to confirm green starting state.
+  5. Restate scope and design choices to the user. Ask clarifying questions until 95% sure of intent.
+  6. THEN code.
+- **Session-end protocol:**
+  1. Confirm `swift build` and `swift test` are green.
+  2. Update `PROGRESS.md`: bump Session count, refresh test count + breakdown, summarise outcome, log architectural decisions, add Session History entry, refresh "Next Session" recommendation.
+  3. Update `SESSION_HANDOFF.md` if the next-session pointer or known-issues priority shifted.
+  4. Commit + fast-forward main + push.
+- **Testing bar** (the "Session 2.5 standard"):
+  - Boundary values for every closed-interval rule (accept at boundary AND reject just outside).
+  - Exact source-line accuracy for any user-facing diagnostic (e.g. line numbers in `ConfigError.description`).
+  - `contains()`-style format tests for stable-but-not-exact strings (resilient to cosmetic reformat, loud about real regressions).
+  - One drift/sync test per public surface (e.g. `config.example.yaml` parses equal to `EngineConfig.default`; bundled Crowd pack parses cleanly).
+- **`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`** is required for `swift test` if `xcode-select -p` points at Command Line Tools. The user's machine has full Xcode, but the path is needed for the test binary to find XCTest. Use this prefix unconditionally on this machine.
+- **The user verifies on M2** — desk-bang and scream both verified there in Session 3+7 final (2026-04-26). Audio playback (Session 4) NOT YET verified by ear.
 
 ## Architecture Decisions Log
 
