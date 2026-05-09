@@ -24,24 +24,14 @@
 | `yellback --config config.example.yaml` (config-print mode, exits) | agent + user manual run | ✅ |
 | `sudo yellback --config config.example.yaml --listen` — scream detection prints `[trigger] scream …` | user on M2, 2026-04-25 | ✅ |
 | `sudo yellback --config config.example.yaml --listen` — desk-bang detection prints `[trigger] desk_bang …` from physical taps | user on M2, 2026-04-26 (after the SPU wake fix landed) | ✅ |
-| **Audio playback through SoundEngine — sound actually heard from speakers** | **NOT YET VERIFIED.** Engineering says it should work; nobody has heard it. | ❌ |
+| **Audio playback through SoundEngine — sound actually heard from speakers** | user on M2, 2026-04-26 — Crowd clip plays as expected on tap | ✅ |
+| **Desk-bang threshold tuning** | user on M2, 2026-04-26 — reports 1.5g default is too high; natural taps don't fire, only firm slams. **Direction: lower the default.** First real empirical data point for cheat audit #5 (calibration). | ⚠️ needs calibration session |
 
-### **The single most important next thing for the user**
+### Verified end-to-end on 2026-04-26 (M2)
 
-Run this command and confirm by ear that tapping the Mac produces an audible sound clip from the Crowd pack:
+`sudo swift run yellback --config config.example.yaml --listen` — user tapped the Mac, heard the Crowd clip play. Session 4 audio path is real, not just test-passing.
 
-```sh
-sudo swift run yellback --config config.example.yaml --listen
-```
-
-Tap firmly → expect a short clap-like burst (low tier) or a longer mid-frequency cheer-like noise (medium tier) or a low-frequency rumble (high tier), depending on tap intensity. The clips are deliberately distinguishable across tiers.
-
-If audio doesn't play but stderr shows `[trigger] desk_bang …`, the engineering needs another iteration. Likely culprits in priority order:
-
-1. SoundEngine started but `setPack` never resolved a pack (check stderr — there's a `audio: loaded pack 'crowd' …` line on success, or an error message on failure).
-2. AVAudioEngine output device routing issue (try unplug/replug of any active audio output).
-3. System mute (engine doesn't currently respect this — see Known Issue).
-4. Format mismatch in the player-node connection (would show up as silent failure; debug with `logging.level: debug` in the config to see SoundEngine diagnostic lines).
+**Outstanding hardware feedback from that test:** the default `gForceThreshold: 1.5` is too high. Natural / comfortable taps don't fire; only firm slams do. **Lower the default** on the next calibration pass. See cheat audit item #5.
 
 ## 3. Resume command (from repo root)
 
@@ -95,8 +85,7 @@ Full list in `PROGRESS.md` § "Known Issues". The ones that bite when changing a
 
 | Option | Scope | Effort |
 |---|---|---|
-| **Verify Session 4 by ear** | User runs `sudo swift run yellback ... --listen`, taps Mac, confirms audio plays | 5 min |
-| **Calibration spike** | Empirical tuning of `gForceThreshold` + intensity scale against actual M-series readings. Adds debug logging that prints raw g-force during taps; user observes; we set sensible defaults. | 30 min |
+| **Calibration spike (recommended first)** | Empirical tuning of `gForceThreshold` + intensity scale against actual M-series readings. User has already reported 1.5g feels too high on M2. Add debug logging that prints raw g-force during taps; user runs `--listen` and taps at varying intensities; pick a sensible default. | 30 min |
 | **Session 4b** | Close the three deferred AUDIO_NOTES items: device-change handler, system-mute via CoreAudio, `Bundle.module` pack resolution | 1–2 hours |
 | **Session 5** | `YellBackEngine` public API + `PrimingState` + engine-level cooldown filtering + `SessionStats`. Replaces CLI's direct detector→soundEngine wiring with the public engine. Detectors' `primingMultiplier` hooks (Session 3 addendum) are already in place — Session 5 wires them. | One full session |
 | **Session 6** | `KeyboardDetector` (CGEventTap, Accessibility permission, conforms to existing `Detector` protocol). | One session |
