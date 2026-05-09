@@ -4,3 +4,7 @@
 DerivedData/
 xcuserdata/
 *.xcodeproj
+
+# ECC handoff: agent worktrees are scratch space, not source.
+# The .claude/PRPs/ tree IS tracked (the canonical roadmap lives there).
+.claude/worktrees/

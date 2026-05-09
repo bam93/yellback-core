@@ -89,6 +89,30 @@ MIT. All audio clips in `Resources/Packs/crowd/` must be CC0 or CC-BY compatible
 
 ## Getting Oriented in This Session
 
-1. Read `PROGRESS.md` for current state
-2. Check the current session's scope in `PROGRESS.md` under "Next Session"
-3. If scope is unclear, ask before proceeding — don't guess at priorities
+The repo is now driven by Everything Claude Code via per-session `/prp-implement` runs against the canonical PRD.
+
+1. Run `/prp-implement .claude/PRPs/yellback-core.prd.md` — ECC reads PROGRESS.md + the PRD, picks the next pending phase whose dependencies are complete, and runs the multi-agent loop end-to-end.
+2. If you need to do something OFF the PRD (one-off fix, exploration), read `PROGRESS.md` first as before, and follow the conventions below.
+3. If scope is unclear, ask before proceeding — don't guess at priorities.
+
+## ECC Handoff Conventions
+
+This repo is driven by Everything Claude Code via per-session `prp-implement` runs against `.claude/PRPs/yellback-core.prd.md`. Every session must honor the conventions below. They override any default ECC behavior that conflicts.
+
+- **Branching:** no feature branches. Worktree branches `claude/<phase>` are fine but session-end fast-forwards `main` and pushes directly. Never open a PR — directly fast-forward.
+- **Commits:** HEREDOC commit messages, one-line summary + blank + body explaining *why*, trailing `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`. Never `--no-verify`. Never `--no-gpg-sign`. Aim for 3-5 commits per session, broken into types → impl → tests → docs.
+- **Test command:** `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`. Every session ends with this green. The `DEVELOPER_DIR` prefix is required for `swift test` to find XCTest on this machine; do not omit it.
+- **Testing bar (Session 2.5 standard):** boundary values for every closed-interval rule (accept-at-boundary AND reject-just-outside); exact source-line accuracy for user-facing diagnostics; `contains()` format tests for stable-but-not-exact strings; one drift/sync test per public surface.
+- **Footguns** (do NOT regress): no `kIOHIDOptionsTypeSeizeDevice`; no per-device `IOHIDDeviceOpen` / `IOHIDDeviceScheduleWithRunLoop` on top of manager-level open; no `CMMotionManager` (`API_UNAVAILABLE(macos)`); no `load(fromByteOffset:as:)` for HID offsets 6/10/14 (use `loadUnaligned`); no allocating `AVAudioPlayerNode` at trigger time; no reinstantiating `AVAudioEngine` on config change; no squashing the three `WIP:` IOKit-debugging commits (`1c411bb`, `7dcec43`, `3225fcd`); no removing the `precondition(retainedAudioSampleCount <= 8)` privacy invariant in `MicDetector` (it IS the privacy enforcement — security-review must not flag it as "unused"); no removing the `onIntensity` API (forward-compat for v2 fusion module). Full list in `SESSION_HANDOFF.md` §7 — re-read before any IOKit or AVAudioEngine work.
+- **Hardware-in-loop:** any phase touching mic, accelerometer, audio output, or keyboard MUST end with a manual user verification step on M2. ECC pauses, prompts the user to run a specified command, waits for confirmation, then proceeds. If the user reports failure, the phase stays `pending` in the PRD — never mark it `complete` without confirmation.
+- **Docs sync:** every session updates PROGRESS.md (Session count, test count breakdown, Session History entry, Next Session) and SESSION_HANDOFF.md if the next-session pointer or known-issues priority shifted. The completed phase in `.claude/PRPs/yellback-core.prd.md` is also marked `complete`.
+- **Quality stack per session:** TDD (tests-first via `tdd-workflow`); `code-review` agent on every change; `security-review` agent on changes touching `Sources/YellBackCore/Detectors/`, `Sources/YellBackCore/Audio/`, or any future `Sources/YellBackCore/Calibration/` write paths; `silent-failure-hunter` on review; `verification-loop` (build + test) before commit. No commit if any gate fails.
+- **License:** MIT. Audio in `Resources/Packs/` must be CC0 or CC-BY 4.0 (CC-BY-NC and proprietary rejected). `ATTRIBUTIONS.md` updated in the same commit as any audio change.
+- **Off-PRD work:** if the user asks for something not in the PRD (e.g. a one-off fix, an exploration, a doc update), don't try to fold it into the PRD — handle it directly, then return to the PRD on the next session.
+
+## General Rules
+- Always run tests before marking task complete
+- Never create files outside the project directory
+- Ask before deleting any file
+- Explain reasoning before writing code
+- If unsure, ask — don't guess
