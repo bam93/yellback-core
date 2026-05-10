@@ -82,126 +82,90 @@ guard shouldListen else {
 
 writeStderr("yellback: listening with config \(configURL.path)")
 
-// MARK: - Bring up the audio engine + load the bundled Crowd pack
+// MARK: - Resolve the bundled-pack dev-mode path
+//
+// The engine resolves packs against `config.packsDirectory`, which defaults
+// to `~/.config/yellback/packs`. When running via `swift run yellback ...`
+// from the repo root (the dev workflow), the user expects the bundled
+// `./Resources/Packs/crowd/` to "just work" without setting up a user
+// pack directory. If the configured pack id maps to a manifest sitting
+// next to cwd's `Resources/Packs/`, we override `packsDirectory` to that
+// cwd-relative path. Phase 4b will replace this with proper `Bundle.module`
+// resolution.
 
-import AVFoundation
+let cwdPacksDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    .appendingPathComponent("Resources/Packs")
+let cwdPackManifest = cwdPacksDir
+    .appendingPathComponent(config.audio.pack)
+    .appendingPathComponent("pack.yaml")
 
-let soundEngine: SoundEngine?
-do {
-    let engine = try SoundEngine()
-    engine.verboseDiagnostics = (config.logging.level == .debug)
-    engine.masterVolume = config.audio.masterVolume
-
-    // Load the bundled Crowd pack from the repo's Resources tree. In the
-    // dev path (`swift run yellback ...` from the repo root), this is
-    // simply `./Resources/Packs/crowd/`. A future packaged release will
-    // resolve via `Bundle.module` once Package.swift declares the
-    // resources properly — see PROGRESS.md known issue.
-    let crowdDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent("Resources/Packs/crowd")
-    if FileManager.default.fileExists(atPath: crowdDir.appendingPathComponent("pack.yaml").path) {
-        do {
-            let outputFormat = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32,
-                sampleRate: 44_100,
-                channels: 2,
-                interleaved: false
-            )!
-            let pack = try PackLoader.load(from: crowdDir, outputFormat: outputFormat)
-            engine.setPack(pack)
-            writeStderr("  audio: loaded pack '\(pack.id)' from \(crowdDir.path)")
-        } catch {
-            writeStderr("  audio: failed to load Crowd pack — \(error). Triggers will fire silently.")
-        }
-    } else {
-        writeStderr("  audio: no bundled Crowd pack at \(crowdDir.path); triggers fire silently. (Run `swift Scripts/generate_placeholder_clips.swift` to make placeholders.)")
-    }
-
-    soundEngine = engine
-} catch {
-    writeStderr("  audio: SoundEngine failed to start — \(error). Triggers will fire silently.")
-    soundEngine = nil
+let effectiveConfig: EngineConfig
+if FileManager.default.fileExists(atPath: cwdPackManifest.path) {
+    effectiveConfig = EngineConfig(
+        triggers: config.triggers,
+        priming: config.priming,
+        audio: config.audio,
+        packsDirectory: cwdPacksDir,
+        logging: config.logging
+    )
+    writeStderr("  packs: using cwd-relative dev path \(cwdPacksDir.path)")
+} else {
+    effectiveConfig = config
 }
 
-/// Closure consumed by detector `onTriggerEvent` callbacks: log the event
-/// AND drive the audio engine. Captured separately so both detectors get
-/// the same wiring without duplicating the body.
-let dispatchTrigger: (TriggerEvent) -> Void = { event in
+// MARK: - Build the YellBackEngine
+//
+// The engine owns SoundEngine setup, pack loading, detector lifecycle,
+// PrimingState, cooldown filtering, and SessionStats. The CLI's job is
+// only to print stderr lines and route SIGINT to engine.stop().
+
+let engine = YellBackEngine(config: effectiveConfig)
+
+engine.onTrigger = { event in
     writeStderr(event.consoleLogLine)
-    soundEngine?.play(intensity: event.intensity)
 }
 
-/// Build the set of detectors to start, in declaration order. Disabled
-/// detectors get a heads-up line and then aren't instantiated.
-var detectors: [Detector] = []
-
-if config.triggers.scream.enabled {
-    let d = MicDetector(config: config.triggers.scream)
-    d.onTriggerEvent = dispatchTrigger
-    if config.logging.level == .debug {
-        d.onIntensitySignal = { sig in
-            writeStderr(String(format: "[intensity] scream     %.3f", sig.value))
-        }
-    }
-    detectors.append(d)
-} else {
-    writeStderr("  triggers.scream: disabled in config — skipping")
-}
-
-if config.triggers.deskBang.enabled {
-    let d = AccelerometerDetector(config: config.triggers.deskBang)
-    d.verboseDiagnostics = (config.logging.level == .debug)
-    d.onTriggerEvent = dispatchTrigger
-    if config.logging.level == .debug {
-        d.onIntensitySignal = { sig in
-            writeStderr(String(format: "[intensity] desk_bang  %.3f", sig.value))
-        }
-    }
-    detectors.append(d)
-} else {
-    writeStderr("  triggers.desk_bang: disabled in config — skipping")
-}
-
-if config.triggers.rageType.enabled {
-    writeStderr("  triggers.rage_type: enabled in config but KeyboardDetector not yet implemented — skipping")
-}
-
-// MARK: - Start detectors
-
-var startedDetectors: [Detector] = []
-
-for d in detectors {
-    let name = d.trigger.snakeCaseName
-    do {
-        try d.start()
-        writeStderr("  triggers.\(name): started")
-        startedDetectors.append(d)
-    } catch let error as DetectorError {
-        writeStderr("  triggers.\(name): NOT started — \(error)")
-    } catch {
-        writeStderr("  triggers.\(name): NOT started — \(error.localizedDescription)")
+if config.logging.level == .debug {
+    engine.onIntensity = { trigger, signal in
+        writeStderr(String(
+            format: "[intensity] %@ %.3f",
+            trigger.snakeCaseName.padding(toLength: 10, withPad: " ", startingAt: 0),
+            signal.value
+        ))
     }
 }
 
-if startedDetectors.isEmpty {
-    writeStderr("no detectors started; exiting.")
+engine.onPermissionStateChange = { state in
+    writeStderr("  permissions: mic=\(state.microphone), accessibility=\(state.accessibility)")
+}
+
+do {
+    try engine.start()
+    for warning in engine.startupWarnings {
+        writeStderr("  warning: \(warning)")
+    }
+    let started = engine.startedTriggers.map { $0.snakeCaseName }.joined(separator: ", ")
+    writeStderr("  started: [\(started)]")
+    writeStderr("listening. Ctrl-C to stop.")
+} catch let error as EngineError {
+    writeStderr("error: \(error)")
+    exit(1)
+} catch {
+    writeStderr("error: \(error.localizedDescription)")
     exit(1)
 }
-
-writeStderr("listening. Ctrl-C to stop.")
 
 // MARK: - SIGINT handler + run loop
 
 // Ignore the default SIGINT (which would terminate immediately) and let
-// our DispatchSource catch it so we can stop detectors cleanly.
+// our DispatchSource catch it so we can stop the engine cleanly.
 signal(SIGINT, SIG_IGN)
 
 let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
 sigintSource.setEventHandler {
-    writeStderr("") // newline past any in-progress ^C echo
-    writeStderr("stopping detectors…")
-    for d in startedDetectors { d.stop() }
-    soundEngine?.stop()
+    writeStderr("")  // newline past any in-progress ^C echo
+    writeStderr("stopping engine…")
+    engine.stop()
     writeStderr("done.")
     exit(0)
 }

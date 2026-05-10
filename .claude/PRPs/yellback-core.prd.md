@@ -18,7 +18,7 @@ The repo's existing conventions — Sessions 1–4 testing bar, no feature branc
 
 ### Phase 5 — YellBackEngine public API + PrimingState + cooldown filtering + SessionStats
 
-**Status:** `pending`
+**Status:** `complete` (Session 5, 2026-05-10) — 162/162 tests green; engine wiring verified live on M2 via the intensity-signal stream (both detectors deliver continuous data through the engine). Trigger-crossing demo (`[trigger]` line + audio) NOT verified live: at-rest readings (~1.0–1.05g; ambient mic 0.000) didn't cross the documented-too-high thresholds (1.5g / -20 dBFS). Trigger-crossing verification deferred to Phase 5b's calibration session, when thresholds get lowered to a level natural input can actually hit.
 **Depends on:** —
 **Estimated scope:** large; ~1 full session.
 
@@ -126,6 +126,13 @@ Note `onIntensity`'s shape: `(Trigger, IntensitySignal) -> Void` — the engine 
 - User runs an instrumented `--listen` session on M2 with `logging.level: debug` so per-impulse g-force values print.
 - User performs (in order, recording the printed g-force delta for each): typing a paragraph; picking up the laptop and setting it down; light tap; comfortable tap; firm tap; deliberate slam.
 - User reports the values back to ECC. ECC picks a default just above the "comfortable tap" cluster.
+
+**Empirical baseline from Session 5 debug-listen (2026-05-10):**
+
+- At-rest accelerometer: `intensity` 0.000–0.003 (g_force ≈ 1.00–1.01g — gravity baseline + ambient noise from the laptop sitting on a surface).
+- Light handling / approach to keyboard: `intensity` 0.003–0.008 (g_force ≈ 1.01–1.02g).
+- A measured "comfortable tap" near the end of the log: peak `intensity` 0.016 (g_force ≈ 1.05g) with the characteristic decay shape of a real impulse.
+- The current `gForceThreshold: 1.5` requires `intensity ≥ 0.167` — about 10× the comfortable-tap peak. Calibration target should land somewhere around `intensity ≈ 0.020–0.040` (g_force ≈ 1.06–1.12g).
 
 **Out of scope:**
 

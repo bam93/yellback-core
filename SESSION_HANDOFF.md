@@ -9,10 +9,10 @@
 - **Repo:** `yellback-core` — open-source Swift Package, the detection engine for [YellBack](https://yellback.app). Consumed by a separate (private) `yellback-mac` repo for the paid app.
 - **GitHub:** `github.com/bam93/yellback-core`. Owner: user goes by `bam93` on GitHub. Pushes use a PAT embedded in the remote URL — visible in `git remote -v`. **Heads up:** rotate that PAT at convenient maintenance time; it's been visible in this conversation's tool output. Switching to a credential helper or a deploy key would harden things.
 - **Branch:** `main`.
-- **Last commit on `origin/main`:** `c9d06ea` — _"Add bundled Crowd placeholder pack + generator script + close out PROGRESS"_.
-- **Last session completed:** **Session 4** (audio output stack — `SoundEngine`, `SoundPack`, `PackLoader`, CLI wiring, bundled Crowd placeholder pack).
-- **Test count:** **135 green**.
-- **Working tree:** clean. Confirmed on 2026-04-26 by `git status --short`.
+- **Last commit on `origin/main`:** Session 5 close-out (YellBackEngine + PrimingState + cooldown filtering + SessionStats).
+- **Last session completed:** **Session 5** (public `YellBackEngine` API + `PrimingState` + engine-level cooldown filtering + `SessionStats`; CLI refactored to use the engine).
+- **Test count:** **162 green**.
+- **Working tree:** clean (post-commit). Confirmed on 2026-05-10.
 - **Worktree path** (for the agent that wrote this): `/Users/claude/Desktop/dev/yellback-core/.claude/worktrees/heuristic-murdock-54f91d/`. Main checkout at `/Users/claude/Desktop/dev/yellback-core/`.
 
 ## 2. Verification status
@@ -39,9 +39,15 @@
 cd /Users/claude/Desktop/dev/yellback-core   # or wherever the user has the main checkout
 git pull
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test    # confirm 135/135 green
-sudo swift run yellback --config config.example.yaml --listen          # tap your Mac, listen for the clip
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test    # confirm 162/162 green
+Scripts/listen.sh                                                       # tap your Mac, listen for the clip
 ```
+
+**Do NOT run `sudo swift run yellback ...` directly.** That re-roots the
+`.build/` artifacts and breaks the next non-sudo `swift test` until you
+`sudo chown -R "$(id -un):staff" .build`. `Scripts/listen.sh` builds as
+the user and only `sudo`s the already-built binary, sidestepping the
+ownership trap entirely.
 
 ## 4. Workflow conventions (established Sessions 1–4)
 
@@ -83,13 +89,17 @@ Full list in `PROGRESS.md` § "Known Issues". The ones that bite when changing a
 
 ## 6. Possible next sessions (rough priority order)
 
+The canonical roadmap now lives in `.claude/PRPs/yellback-core.prd.md` — pick the next phase whose status is `pending` and whose dependencies are all `complete`. Phase 5 just landed.
+
 | Option | Scope | Effort |
 |---|---|---|
-| **Calibration spike (recommended first)** | Empirical tuning of `gForceThreshold` + intensity scale against actual M-series readings. User has already reported 1.5g feels too high on M2. Add debug logging that prints raw g-force during taps; user runs `--listen` and taps at varying intensities; pick a sensible default. | 30 min |
-| **Session 4b** | Close the three deferred AUDIO_NOTES items: device-change handler, system-mute via CoreAudio, `Bundle.module` pack resolution | 1–2 hours |
-| **Session 5** | `YellBackEngine` public API + `PrimingState` + engine-level cooldown filtering + `SessionStats`. Replaces CLI's direct detector→soundEngine wiring with the public engine. Detectors' `primingMultiplier` hooks (Session 3 addendum) are already in place — Session 5 wires them. | One full session |
-| **Session 6** | `KeyboardDetector` (CGEventTap, Accessibility permission, conforms to existing `Detector` protocol). | One session |
-| **Session 12 (much later)** | Source real CC0/CC-BY audio for the Crowd pack. Replaces synthesised placeholders. Content work, not engineering. | Half session |
+| **Phase 5b** (recommended first) | Empirical tuning of `gForceThreshold` on M2. User has already reported 1.5g feels too high. Hardware-in-loop required (read raw g-force values across a tap-intensity sequence; pick a default). One-line config + struct-default change + adjusted boundary tests. | 30–60 min |
+| **Phase 5c** | TextEngine outlet — second reaction outlet alongside audio. New `TextEngine`, `TextPack`, `TextPackLoader`, bundled `text.yaml`, `onTextReaction` callback. Mirrors the audio path's architecture exactly. | One full session |
+| **Phase 4b** | Close the three deferred AUDIO_NOTES items: device-change handler, system-mute via CoreAudio, `Bundle.module` pack resolution. Engine now owns the SoundEngine lifecycle, so device-change handler hooks cleanly. | 1–2 hours |
+| **Phase 6** | `KeyboardDetector` (CGEventTap, Accessibility permission, conforms to existing `Detector` protocol). Engine slot is ready — replaces the current "rage_type detector not yet implemented" warning. | One session |
+| **Phase 5d** | DialogueState — call-and-response loop after Phase 5c lands. Mic suppression during engine playback, intensity mirroring per round. | One full session |
+| **Phase 7** | Per-machine calibration onboarding (`yellback --calibrate`). Solves the architectural class-of-bug behind 5b's empirical fix. | One full session |
+| **Phase 12 (much later)** | Source real CC0/CC-BY audio for the Crowd pack + curated text phrases. Content work, not engineering. | Half session |
 
 ## 7. Things to NOT do (footguns)
 
@@ -158,6 +168,7 @@ Full detail in `PROGRESS.md` § "Session History". Quick scan:
 | Cheat audit batch 2 | 2026-04-26 | Land 3 more audit fixes (mic permission timeout, `TriggerEvent.consoleLogLine`, parseReport wire-format tests) | 115 | `cff3dc6` |
 | Known Issues doc | 2026-04-26 | Document 5 surfaced footguns | 115 | `67cd9ad` |
 | 4 | 2026-04-26 | `SoundEngine` + `SoundPack` + `PackLoader` + bundled Crowd placeholder pack + CLI wiring | 135 | `e07f4d8` → `c9d06ea` |
+| 5 | 2026-05-10 | `YellBackEngine` public API + `PrimingState` + engine-level cooldown filtering + `SessionStats` + CLI refactor. First ECC-driven session per the canonical PRD. | 162 | (this session) |
 
 ## 12. If you're an agent picking this up cold
 
