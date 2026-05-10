@@ -66,6 +66,13 @@ public protocol Detector: AnyObject {
     /// regardless of threshold. Set by the engine before `start()`.
     var onIntensitySignal: ((IntensitySignal) -> Void)? { get set }
 
+    /// Engine-set threshold multiplier for the priming state. `1.0` means no
+    /// priming (run at base threshold). Values below `1.0` lower the
+    /// effective threshold (per `ARCHITECTURE.md` §"The Priming State"). The
+    /// engine sets this when `PrimingState` transitions; detectors apply it
+    /// at trigger-evaluation time.
+    var primingMultiplier: Double { get set }
+
     /// Begin observing the detector's input source (mic / keyboard /
     /// accelerometer). Throws on hardware unavailability or input-setup
     /// failure. Idempotent — replaces any previously-installed input.
